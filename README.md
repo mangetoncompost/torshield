@@ -34,13 +34,15 @@ brew install --cask torshield
 
 ### From source
 
+Requires Rust and the [Tauri CLI](https://tauri.app/start/prerequisites/).
+
 ```bash
 git clone https://github.com/mangetoncompost/torshield
-cd torshield/src-tauri
-cargo build --release
+cd torshield
+cargo tauri build
 ```
 
-App ends up in `target/release/bundle/macos/TorShield.app`.
+App ends up in `src-tauri/target/release/bundle/macos/TorShield.app`.
 
 ## What it does
 
