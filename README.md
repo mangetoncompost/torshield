@@ -25,12 +25,7 @@ No window. No dock icon. Just a shield in your menubar.
 
 ## Install
 
-### Homebrew
-
-```bash
-brew tap mangetoncompost/tap
-brew install --cask torshield
-```
+Download the latest DMG from [Releases](https://github.com/mangetoncompost/torshield/releases), open it and drag TorShield to `/Applications`.
 
 ### From source
 
