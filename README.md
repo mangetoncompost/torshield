@@ -25,9 +25,10 @@ No window. No dock icon. Just a shield in your menubar.
 
 ## Install
 
-### Homebrew *(coming soon)*
+### Homebrew
 
 ```bash
+brew tap mangetoncompost/tap
 brew install --cask torshield
 ```
 
