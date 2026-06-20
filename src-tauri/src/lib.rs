@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tauri::{
@@ -7,6 +8,7 @@ use tauri::{
     AppHandle,
 };
 use tauri_plugin_autostart::MacosLauncher;
+use tokio::sync::watch;
 
 // ── SF Symbol icon generation ─────────────────────────────────────────────────
 
@@ -37,12 +39,12 @@ pub struct Config {
     pub exclude_nz:   bool,
     pub exclude_de:   bool,
     pub exclude_fr:   bool,
-    pub rotate_mins:  u32,   // 0 = désactivé
+    pub rotate_mins:  u32,   // 0 = desactive
     pub mac_spoof:    bool,
     pub dns_leak:     bool,  // dnsmasq over Tor
     pub pf_firewall:  bool,  // bloque tout non-Tor
     pub clear_logs:   bool,
-    pub firefox:      bool,  // hardening Firefox activé
+    pub firefox:      bool,  // hardening Firefox active
     pub resist_fp:    bool,  // resistFingerprinting (casse WebGL/canvas)
     pub ua_spoof:     bool,
     pub lang_spoof:   bool,
@@ -71,7 +73,9 @@ impl Config {
             .unwrap_or_default()
     }
     fn save(&self) {
-        let path = format!("{}/.config/opsec/torshield.json", std::env::var("HOME").unwrap_or_default());
+        let dir = opsec_dir();
+        std::fs::create_dir_all(&dir).ok();
+        let path = format!("{}/torshield.json", dir);
         if let Ok(json) = serde_json::to_string_pretty(self) {
             std::fs::write(path, json).ok();
         }
@@ -107,6 +111,8 @@ fn opsec_dir() -> String {
     format!("{}/.config/opsec", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
 }
 
+fn lock_path() -> String { format!("{}/active.lock", opsec_dir()) }
+
 fn sh(cmd: &str, args: &[&str]) {
     Command::new(cmd).args(args).output().ok();
 }
@@ -132,6 +138,14 @@ fn tor_ready() -> bool {
 fn tor_pid() -> Option<u32> {
     std::fs::read_to_string(format!("{}/tor.pid", opsec_dir())).ok()
         .and_then(|s| s.trim().parse().ok())
+}
+
+fn rand_bytes(n: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; n];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        f.read_exact(&mut buf).ok();
+    }
+    buf
 }
 
 async fn fetch_tor_ip() -> Option<String> {
@@ -164,7 +178,7 @@ fn start_tor(cfg: &Config) -> bool {
         "SocksPort 9050\nControlPort 9051\nCookieAuthentication 1\n\
          CookieAuthFile {cookie}/control_auth_cookie\n\
          DataDirectory {data}\nLog notice file {log}\n\
-         MaxCircuitDirtiness 600\n{exclude_line}"
+         DNSPort 9053\nMaxCircuitDirtiness 600\n{exclude_line}"
     )).ok();
     Command::new("tor").args(["-f", &conf, "--PidFile", &pid, "--RunAsDaemon", "1"]).spawn().is_ok()
 }
@@ -174,18 +188,24 @@ fn stop_tor() {
     std::fs::remove_file(format!("{}/tor.pid", opsec_dir())).ok();
 }
 
-fn new_tor_identity() {
+// Envoie SIGNAL NEWNYM et verifie la reponse. Retourne true si succes.
+fn new_tor_identity() -> bool {
     let cookie = format!("{}/tor_data/control_auth/control_auth_cookie", opsec_dir());
     let auth = std::fs::read(&cookie)
         .map(|b| b.iter().map(|x| format!("{:02x}", x)).collect::<String>())
         .unwrap_or_default();
-    if let Ok(mut s) = std::net::TcpStream::connect("127.0.0.1:9051") {
-        use std::io::Write;
-        s.write_all(format!("AUTHENTICATE {}\r\nSIGNAL NEWNYM\r\nQUIT\r\n", auth).as_bytes()).ok();
+    let Ok(mut s) = std::net::TcpStream::connect("127.0.0.1:9051") else { return false; };
+    s.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok();
+    use std::io::Write;
+    if s.write_all(format!("AUTHENTICATE {}\r\nSIGNAL NEWNYM\r\nQUIT\r\n", auth).as_bytes()).is_err() {
+        return false;
     }
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).ok();
+    resp.contains("250 OK")
 }
 
-// ── Proxy système ─────────────────────────────────────────────────────────────
+// ── Proxy systeme ─────────────────────────────────────────────────────────────
 
 fn proxy_enable() {
     for svc in get_network_services() {
@@ -212,53 +232,55 @@ fn ipv6_restore() {
 
 // ── MAC spoofing ──────────────────────────────────────────────────────────────
 
+// Lit la MAC hardware permanente via networksetup (independante du spoofing actif)
+fn hw_mac(iface: &str) -> Option<String> {
+    let out = Command::new("networksetup").arg("-getmacaddress").arg(iface).output().ok()?;
+    let stdout = String::from_utf8(out.stdout).ok()?;
+    // Format : "Ethernet Address: xx:xx:xx:xx:xx:xx (Device: en0)"
+    stdout.split_whitespace()
+        .find(|w| w.contains(':') && w.len() == 17)
+        .map(|s| s.to_string())
+}
+
 fn mac_spoof_enable() {
     let iface = primary_interface();
-    // Génère une MAC random avec bit "locally administered" à 1
-    let b = || -> u8 { (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
-        .subsec_nanos() & 0xFF) as u8 };
+    let b = rand_bytes(6);
+    // bit 1 = locally administered, bit 0 = unicast
     let mac = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        (b() & 0xFE) | 0x02, b(), b(), b(), b(), b());
+        (b[0] & 0xFE) | 0x02, b[1], b[2], b[3], b[4], b[5]);
     sh("ifconfig", &[&iface, "ether", &mac]);
 }
 
 fn mac_spoof_restore() {
-    // Recharge le HW MAC via networksetup (relink interface)
     let iface = primary_interface();
-    sh("ifconfig", &[&iface, "down"]);
-    sh("ifconfig", &[&iface, "up"]);
+    // networksetup -getmacaddress retourne toujours la MAC hardware
+    // meme quand l'interface est actuellement spoofee
+    if let Some(orig) = hw_mac(&iface) {
+        sh("ifconfig", &[&iface, "ether", &orig]);
+    }
 }
 
 // ── DNS leak fix via dnsmasq ──────────────────────────────────────────────────
 
 fn dns_leak_enable() {
-    // Configure dnsmasq pour résoudre tout via Tor (127.0.0.1:9053)
-    // Tor doit écouter sur DNSPort 9053
     let dir = opsec_dir();
+    let pid_file = format!("{}/dnsmasq.pid", dir);
     let dnsmasq_conf = format!("{}/dnsmasq.conf", dir);
-    std::fs::write(&dnsmasq_conf,
-        "no-resolv\nserver=127.0.0.1#9053\nlisten-address=127.0.0.1\nport=5353\n"
-    ).ok();
 
-    // Patch torrc pour ajouter DNSPort (si supporté par cette build)
-    let torrc = format!("{}/torrc", dir);
-    if let Ok(mut content) = std::fs::read_to_string(&torrc) {
-        if !content.contains("DNSPort") {
-            content.push_str("DNSPort 9053\n");
-            std::fs::write(&torrc, &content).ok();
-            // Reload tor
-            if let Some(pid) = tor_pid() {
-                sh("kill", &["-HUP", &pid.to_string()]);
-            }
-        }
-    }
+    // DNSPort 9053 est inclus dans le torrc depuis start_tor()
+    // dnsmasq ecoute sur 127.0.0.1:53 et forward tout vers Tor 127.0.0.1:9053
+    // Port 53 requiert root - on passe via osascript pour demander le mot de passe
+    std::fs::write(&dnsmasq_conf, format!(
+        "no-resolv\nserver=127.0.0.1#9053\nlisten-address=127.0.0.1\nport=53\n\
+         pid-file={pid_file}\n"
+    )).ok();
 
-    // Lance dnsmasq
     if Command::new("which").arg("dnsmasq").output().map(|o| o.status.success()).unwrap_or(false) {
-        Command::new("dnsmasq").args(["-C", &dnsmasq_conf, "--pid-file=/tmp/torshield_dnsmasq.pid"])
-            .spawn().ok();
-        // Force DNS système vers 127.0.0.1
+        // Lance dnsmasq avec sudo via osascript (demande elevation macOS native)
+        let script = format!(
+            "do shell script \"dnsmasq -C '{dnsmasq_conf}'\" with administrator privileges"
+        );
+        Command::new("osascript").args(["-e", &script]).output().ok();
         for svc in get_network_services() {
             sh("networksetup", &["-setdnsservers", &svc, "127.0.0.1"]);
         }
@@ -266,57 +288,71 @@ fn dns_leak_enable() {
 }
 
 fn dns_leak_disable() {
-    // Arrête dnsmasq
-    if let Ok(pid) = std::fs::read_to_string("/tmp/torshield_dnsmasq.pid") {
+    let dir = opsec_dir();
+    let pid_file = format!("{}/dnsmasq.pid", dir);
+    if let Ok(pid) = std::fs::read_to_string(&pid_file) {
         sh("kill", &[pid.trim()]);
-        std::fs::remove_file("/tmp/torshield_dnsmasq.pid").ok();
+        std::fs::remove_file(&pid_file).ok();
     }
-    sh("pkill", &["-f", "dnsmasq.*torshield"]);
-    // Remet DNS automatique
+    // Fallback : pkill sur le conf specifique au cas ou pid-file manque
+    let dnsmasq_conf = format!("{}/dnsmasq.conf", dir);
+    sh("pkill", &["-f", &format!("dnsmasq.*{}", dnsmasq_conf)]);
     for svc in get_network_services() {
         sh("networksetup", &["-setdnsservers", &svc, "empty"]);
     }
 }
 
-// ── pf firewall — kill switch ─────────────────────────────────────────────────
+// ── pf firewall - kill switch ─────────────────────────────────────────────────
 
-const PF_RULES: &str = r#"
-# TorShield kill switch — tout doit passer par Tor
-set skip on lo0
-block all
-pass out on en0 proto tcp to 127.0.0.1 port 9050 keep state
-pass out on en0 proto tcp to any port 9050 keep state
-pass out proto udp to any port 53 keep state
-pass in all
-"#;
+fn build_pf_rules() -> String {
+    let iface = primary_interface();
+    format!(
+        "# TorShield kill switch\n\
+         set skip on lo0\n\
+         block all\n\
+         pass out on {iface} proto tcp to 127.0.0.1 port 9050 keep state\n\
+         pass out on {iface} proto tcp to any port 9050 keep state\n\
+         pass out proto udp to any port 53 keep state\n\
+         pass in all\n"
+    )
+}
 
 fn pf_enable() {
-    std::fs::write("/tmp/torshield_pf.conf", PF_RULES).ok();
-    // Backup
-    Command::new("pfctl").args(["-sr"]).output()
-        .map(|o| std::fs::write("/tmp/torshield_pf_backup.txt", o.stdout).ok()).ok();
-    sh("pfctl", &["-f", "/tmp/torshield_pf.conf", "-e"]);
+    let pf_conf = format!("{}/pf.conf", opsec_dir());
+    std::fs::write(&pf_conf, build_pf_rules()).ok();
+    let pf_backup = format!("{}/pf_backup.txt", opsec_dir());
+    // Backup des regles actuelles
+    if let Ok(out) = Command::new("pfctl").args(["-sr"]).output() {
+        if !out.stdout.is_empty() {
+            std::fs::write(&pf_backup, &out.stdout).ok();
+        }
+    }
+    sh("pfctl", &["-f", &pf_conf, "-e"]);
 }
 
 fn pf_disable() {
-    // Restore ou désactive simplement
-    if std::path::Path::new("/tmp/torshield_pf_backup.txt").exists() {
-        sh("pfctl", &["-f", "/tmp/torshield_pf_backup.txt"]);
+    let pf_backup = format!("{}/pf_backup.txt", opsec_dir());
+    let pf_conf   = format!("{}/pf.conf", opsec_dir());
+    if std::path::Path::new(&pf_backup).exists() {
+        // Verifie que le backup n'est pas vide avant d'appliquer
+        if std::fs::metadata(&pf_backup).map(|m| m.len() > 0).unwrap_or(false) {
+            sh("pfctl", &["-f", &pf_backup]);
+        } else {
+            sh("pfctl", &["-d"]);
+        }
+        std::fs::remove_file(&pf_backup).ok();
     } else {
         sh("pfctl", &["-d"]);
     }
-    std::fs::remove_file("/tmp/torshield_pf.conf").ok();
+    std::fs::remove_file(&pf_conf).ok();
 }
 
-// ── Logs système ──────────────────────────────────────────────────────────────
+// ── Logs systeme ──────────────────────────────────────────────────────────────
 
 fn clear_logs() {
-    // Efface les logs unifiés macOS (nécessite root via sudo ou privileges)
     Command::new("log").args(["erase", "--all"]).output().ok();
-    // Logs réseau
     std::fs::remove_dir_all(format!("{}/Library/Logs/CrashReporter",
         std::env::var("HOME").unwrap_or_default())).ok();
-    // Tor log
     std::fs::write(format!("{}/tor.log", opsec_dir()), "").ok();
 }
 
@@ -354,14 +390,23 @@ user_pref("browser.startup.page", 3);
     p
 }
 
+fn firefox_running() -> bool {
+    Command::new("pgrep").args(["-x", "firefox"]).output()
+        .map(|o| o.status.success()).unwrap_or(false)
+}
+
 fn firefox_apply(enable: bool, cfg: &Config) {
     let home = std::env::var("HOME").unwrap_or_default();
     let ff = format!("{}/Library/Application Support/Firefox/Profiles", home);
     if !std::path::Path::new(&ff).is_dir() { return; }
 
-    Command::new("osascript")
-        .args(["-e", "tell application \"Firefox\" to quit"]).output().ok();
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    let was_running = firefox_running();
+
+    if was_running {
+        Command::new("osascript")
+            .args(["-e", "tell application \"Firefox\" to quit"]).output().ok();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
 
     let blocked = [
         "TorShield", "network.proxy", "media.peerconnection",
@@ -414,7 +459,11 @@ fn firefox_apply(enable: bool, cfg: &Config) {
             }
         }
     }
-    Command::new("open").args(["-a", "Firefox"]).spawn().ok();
+
+    // Rouvre Firefox seulement si elle tournait avant
+    if was_running {
+        Command::new("open").args(["-a", "Firefox"]).spawn().ok();
+    }
 }
 
 // ── Enable / Disable OPSEC ────────────────────────────────────────────────────
@@ -438,6 +487,11 @@ async fn do_enable(shared: &Shared) {
     if cfg.pf_firewall { pf_enable(); }
     if cfg.firefox     { firefox_apply(true, &cfg); }
 
+    // Marque la session comme active pour recovery apres crash
+    let dir = opsec_dir();
+    std::fs::create_dir_all(&dir).ok();
+    std::fs::write(lock_path(), "").ok();
+
     let tor_ip  = fetch_tor_ip().await;
     let real_ip = fetch_real_ip().await;
 
@@ -458,6 +512,8 @@ async fn do_disable(shared: &Shared) {
     stop_tor();
     if cfg.mac_spoof { mac_spoof_restore(); }
 
+    std::fs::remove_file(lock_path()).ok();
+
     let real_ip = fetch_real_ip().await;
 
     let mut lock = shared.lock().unwrap();
@@ -466,13 +522,25 @@ async fn do_disable(shared: &Shared) {
     lock.0.real_ip = real_ip;
 }
 
+// Teardown d'urgence sans async (utilise au quit et recovery)
+fn emergency_teardown(cfg: &Config) {
+    if cfg.pf_firewall  { pf_disable(); }
+    if cfg.dns_leak     { dns_leak_disable(); }
+    proxy_disable();
+    ipv6_restore();
+    if cfg.firefox      { firefox_apply(false, cfg); }
+    stop_tor();
+    if cfg.mac_spoof    { mac_spoof_restore(); }
+    std::fs::remove_file(lock_path()).ok();
+}
+
 // ── Menu ──────────────────────────────────────────────────────────────────────
 
 fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
     use tauri_plugin_autostart::ManagerExt;
     let active  = state.active;
-    let tor_ip  = state.tor_ip.clone().unwrap_or_else(|| "—".into());
-    let real_ip = state.real_ip.clone().unwrap_or_else(|| "—".into());
+    let tor_ip  = state.tor_ip.clone().unwrap_or_else(|| "-".into());
+    let real_ip = state.real_ip.clone().unwrap_or_else(|| "-".into());
 
     let mk  = |id: &str, label: &str| MenuItemBuilder::new(label).id(id).build(app).unwrap();
     let mkd = |id: &str, label: &str| MenuItemBuilder::new(label).id(id).enabled(false).build(app).unwrap();
@@ -480,36 +548,36 @@ fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
         CheckMenuItemBuilder::new(label).id(id).checked(checked).build(app).unwrap();
 
     // ── Status ──
-    let status_label = if active { format!("● Actif  —  {}", tor_ip) } else { "○ Inactif".into() };
+    let status_label = if active { format!("Actif  {}  {}", "-", tor_ip) } else { "Inactif".into() };
     let item_status  = mkd("status", &status_label);
-    let item_real    = mkd("real_ip", &format!("IP réelle : {}  (masquée)", real_ip));
+    let item_real    = mkd("real_ip", &format!("IP reelle : {}  (masquee)", real_ip));
 
     // ── Actions ──
-    let item_toggle  = mk("toggle",  if active { "Désactiver OPSEC" } else { "Activer OPSEC" });
-    let item_rotate  = MenuItemBuilder::new("Nouvelle identité Tor")
+    let item_toggle  = mk("toggle",  if active { "Desactiver OPSEC" } else { "Activer OPSEC" });
+    let item_rotate  = MenuItemBuilder::new("Nouvelle identite Tor")
         .id("rotate").enabled(active).build(app).unwrap();
 
     // ── Sous-menu Exit nodes ──
     let sub_nodes = SubmenuBuilder::new(app, "Pays exclus (exit nodes)")
-        .item(&chk("node_us", "🇺🇸  États-Unis",    cfg.exclude_us))
-        .item(&chk("node_gb", "🇬🇧  Royaume-Uni",   cfg.exclude_gb))
-        .item(&chk("node_au", "🇦🇺  Australie",     cfg.exclude_au))
-        .item(&chk("node_ca", "🇨🇦  Canada",         cfg.exclude_ca))
-        .item(&chk("node_nz", "🇳🇿  Nouvelle-Zélande", cfg.exclude_nz))
-        .item(&chk("node_de", "🇩🇪  Allemagne",     cfg.exclude_de))
-        .item(&chk("node_fr", "🇫🇷  France",         cfg.exclude_fr))
+        .item(&chk("node_us", "US  Etats-Unis",      cfg.exclude_us))
+        .item(&chk("node_gb", "GB  Royaume-Uni",     cfg.exclude_gb))
+        .item(&chk("node_au", "AU  Australie",       cfg.exclude_au))
+        .item(&chk("node_ca", "CA  Canada",           cfg.exclude_ca))
+        .item(&chk("node_nz", "NZ  Nouvelle-Zelande", cfg.exclude_nz))
+        .item(&chk("node_de", "DE  Allemagne",       cfg.exclude_de))
+        .item(&chk("node_fr", "FR  France",           cfg.exclude_fr))
         .build().unwrap();
 
     // ── Sous-menu Rotation ──
     let rot_label = match cfg.rotate_mins {
-        0   => "Rotation auto : désactivée",
-        5   => "Rotation auto : 5 min ✓",
-        15  => "Rotation auto : 15 min ✓",
-        30  => "Rotation auto : 30 min ✓",
+        0   => "Rotation auto : desactivee",
+        5   => "Rotation auto : 5 min",
+        15  => "Rotation auto : 15 min",
+        30  => "Rotation auto : 30 min",
         _   => "Rotation auto",
     };
     let sub_rotate = SubmenuBuilder::new(app, rot_label)
-        .item(&chk("rot_off", "Désactivée",    cfg.rotate_mins == 0))
+        .item(&chk("rot_off", "Desactivee",          cfg.rotate_mins == 0))
         .item(&chk("rot_5",   "Toutes les 5 min",  cfg.rotate_mins == 5))
         .item(&chk("rot_15",  "Toutes les 15 min", cfg.rotate_mins == 15))
         .item(&chk("rot_30",  "Toutes les 30 min", cfg.rotate_mins == 30))
@@ -518,18 +586,18 @@ fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
     // ── Sous-menu Protections ──
     let sub_prot = SubmenuBuilder::new(app, "Protections")
         .item(&chk("prot_ff",   "Firefox (proxy + WebRTC off)",   cfg.firefox))
-        .item(&chk("prot_rfp",  "Firefox resistFingerprinting ⚠", cfg.resist_fp))
+        .item(&chk("prot_rfp",  "Firefox resistFingerprinting", cfg.resist_fp))
         .item(&chk("prot_mac",  "Spoofing MAC",                   cfg.mac_spoof))
-        .item(&chk("prot_dns",  "Anti DNS leak (dnsmasq)",      cfg.dns_leak))
-        .item(&chk("prot_pf",   "Kill switch (pf firewall)",    cfg.pf_firewall))
-        .item(&chk("prot_logs", "Effacer logs au démarrage",    cfg.clear_logs))
-        .item(&chk("prot_ua",   "User-Agent Windows/Firefox",   cfg.ua_spoof))
-        .item(&chk("prot_lang", "Langue neutre (en-US)",        cfg.lang_spoof))
+        .item(&chk("prot_dns",  "Anti DNS leak (dnsmasq)",       cfg.dns_leak))
+        .item(&chk("prot_pf",   "Kill switch (pf firewall)",     cfg.pf_firewall))
+        .item(&chk("prot_logs", "Effacer logs au demarrage",     cfg.clear_logs))
+        .item(&chk("prot_ua",   "User-Agent Windows/Firefox",    cfg.ua_spoof))
+        .item(&chk("prot_lang", "Langue neutre (en-US)",         cfg.lang_spoof))
         .build().unwrap();
 
-    // ── Démarrage auto ──
+    // ── Demarrage auto ──
     let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
-    let item_login = chk("login", "Lancer au démarrage", autostart_on);
+    let item_login = chk("login", "Lancer au demarrage", autostart_on);
 
     let menu = MenuBuilder::new(app)
         .item(&item_status)
@@ -573,7 +641,17 @@ fn toggle_cfg<F: FnOnce(&mut Config)>(shared: &Shared, f: F) -> Config {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let cfg = Config::load();
+
+    // Recovery apres crash : si le lock existe, Tor etait actif et l'app a crashe
+    // On fait un teardown propre pour ne pas laisser le reseau en etat partiel
+    if std::path::Path::new(&lock_path()).exists() {
+        emergency_teardown(&cfg);
+    }
+
     let shared: Shared = Arc::new(Mutex::new((OpsecState::default(), cfg)));
+
+    // Channel pour notifier la boucle de rotation que rotate_mins a change
+    let (rot_tx, rot_rx) = watch::channel::<u32>(0);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -584,11 +662,10 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             // Icones SF Symbols
-            let _ = std::fs::remove_file("/tmp/torshield_gen_icon"); // force recompile propre
+            let _ = std::fs::remove_file("/tmp/torshield_gen_icon");
             sf_symbol_png("shield",           18, "/tmp/torshield_off.png");
             sf_symbol_png("lock.shield.fill", 18, "/tmp/torshield_on.png");
 
-            // Fallback infaillible : RGBA 18x18 transparent si aucun PNG dispo
             let icon = std::fs::read("/tmp/torshield_off.png")
                 .ok()
                 .and_then(|b| Image::from_bytes(&b).ok())
@@ -607,6 +684,7 @@ pub fn run() {
                 .on_menu_event(move |app, event| {
                     let shared = shared_ref.clone();
                     let app    = app.clone();
+                    let rot_tx = rot_tx.clone();
                     match event.id().as_ref() {
 
                         // ── Toggle principal ──
@@ -643,16 +721,31 @@ pub fn run() {
                         "node_fr" => { let cfg = toggle_cfg(&shared, |c| c.exclude_fr = !c.exclude_fr); let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
 
                         // ── Rotation auto ──
-                        "rot_off" => { let cfg = toggle_cfg(&shared, |c| c.rotate_mins = 0);  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
-                        "rot_5"   => { let cfg = toggle_cfg(&shared, |c| c.rotate_mins = 5);  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
-                        "rot_15"  => { let cfg = toggle_cfg(&shared, |c| c.rotate_mins = 15); let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
-                        "rot_30"  => { let cfg = toggle_cfg(&shared, |c| c.rotate_mins = 30); let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
+                        "rot_off" => {
+                            let cfg = toggle_cfg(&shared, |c| c.rotate_mins = 0);
+                            rot_tx.send(0).ok();
+                            let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg);
+                        }
+                        "rot_5" => {
+                            let cfg = toggle_cfg(&shared, |c| c.rotate_mins = 5);
+                            rot_tx.send(5).ok();
+                            let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg);
+                        }
+                        "rot_15" => {
+                            let cfg = toggle_cfg(&shared, |c| c.rotate_mins = 15);
+                            rot_tx.send(15).ok();
+                            let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg);
+                        }
+                        "rot_30" => {
+                            let cfg = toggle_cfg(&shared, |c| c.rotate_mins = 30);
+                            rot_tx.send(30).ok();
+                            let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg);
+                        }
 
                         // ── Protections ──
                         "prot_ff" => {
                             let cfg = toggle_cfg(&shared, |c| c.firefox = !c.firefox);
                             let (state, _) = shared.lock().unwrap().clone();
-                            // applique immédiatement si OPSEC déjà actif
                             if state.active { firefox_apply(cfg.firefox, &cfg); }
                             rebuild_menu(&app, &state, &cfg);
                         }
@@ -684,12 +777,7 @@ pub fn run() {
                             let active = shared.lock().unwrap().0.active;
                             if active {
                                 let cfg = shared.lock().unwrap().1.clone();
-                                if cfg.pf_firewall  { pf_disable(); }
-                                if cfg.dns_leak     { dns_leak_disable(); }
-                                proxy_disable(); ipv6_restore();
-                                if cfg.firefox { firefox_apply(false, &cfg); }
-                                stop_tor();
-                                if cfg.mac_spoof { mac_spoof_restore(); }
+                                emergency_teardown(&cfg);
                             }
                             std::process::exit(0);
                         }
@@ -698,9 +786,9 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // IP réelle au démarrage
-            let shared2   = shared.clone();
-            let app2      = app_handle.clone();
+            // IP reelle au demarrage
+            let shared2 = shared.clone();
+            let app2    = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 let ip = fetch_real_ip().await;
                 let mut lock = shared2.lock().unwrap();
@@ -710,22 +798,38 @@ pub fn run() {
                 rebuild_menu(&app2, &state, &cfg);
             });
 
-            // Rotation automatique si configurée
+            // Rotation automatique avec reset propre sur changement de config
             let shared3 = shared.clone();
             let app3    = app_handle.clone();
+            let mut rot_rx = rot_rx;
             tauri::async_runtime::spawn(async move {
                 loop {
                     let mins = shared3.lock().unwrap().1.rotate_mins;
-                    if mins > 0 && shared3.lock().unwrap().0.active {
-                        tokio::time::sleep(std::time::Duration::from_secs(mins as u64 * 60)).await;
-                        new_tor_identity();
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        let ip = fetch_tor_ip().await;
-                        shared3.lock().unwrap().0.tor_ip = ip;
-                        let (state, cfg) = shared3.lock().unwrap().clone();
-                        rebuild_menu(&app3, &state, &cfg);
-                    } else {
-                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    if mins == 0 || !shared3.lock().unwrap().0.active {
+                        // Attend soit un changement de config, soit 30s
+                        tokio::select! {
+                            _ = rot_rx.changed() => {}
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                        }
+                        continue;
+                    }
+                    // Attend le timer ou un reset de config
+                    let sleep = tokio::time::sleep(std::time::Duration::from_secs(mins as u64 * 60));
+                    tokio::pin!(sleep);
+                    tokio::select! {
+                        _ = &mut sleep => {
+                            if shared3.lock().unwrap().0.active {
+                                new_tor_identity();
+                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                let ip = fetch_tor_ip().await;
+                                shared3.lock().unwrap().0.tor_ip = ip;
+                                let (state, cfg) = shared3.lock().unwrap().clone();
+                                rebuild_menu(&app3, &state, &cfg);
+                            }
+                        }
+                        _ = rot_rx.changed() => {
+                            // rotate_mins a change, recommence avec la nouvelle valeur
+                        }
                     }
                 }
             });
