@@ -583,17 +583,18 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            // Icônes SF Symbols
+            // Icones SF Symbols
+            let _ = std::fs::remove_file("/tmp/torshield_gen_icon"); // force recompile propre
             sf_symbol_png("shield",           18, "/tmp/torshield_off.png");
             sf_symbol_png("lock.shield.fill", 18, "/tmp/torshield_on.png");
-            if !std::path::Path::new("/tmp/torshield_off.png").exists() {
-                std::fs::write("/tmp/torshield_off.png", include_bytes!("../icons/tray_off.png")).ok();
-                std::fs::write("/tmp/torshield_on.png",  include_bytes!("../icons/tray_on.png")).ok();
-            }
 
-            let icon_bytes = std::fs::read("/tmp/torshield_off.png")
-                .unwrap_or_else(|_| include_bytes!("../icons/tray_off.png").to_vec());
-            let icon = Image::from_bytes(&icon_bytes)?;
+            // Fallback infaillible : RGBA 18x18 transparent si aucun PNG dispo
+            let icon = std::fs::read("/tmp/torshield_off.png")
+                .ok()
+                .and_then(|b| Image::from_bytes(&b).ok())
+                .unwrap_or_else(|| {
+                    Image::new_owned(vec![0u8; 18 * 18 * 4], 18, 18)
+                });
 
             let shared_ref = shared.clone();
             let app_handle = app.handle().clone();
