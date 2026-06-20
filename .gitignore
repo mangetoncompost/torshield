@@ -20,3 +20,7 @@ src-tauri/gen/
 *.log
 *.pem
 *.key
+
+# Dev instructions
+CLAUDE.md
+make_demo.sh
