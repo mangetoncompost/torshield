@@ -548,56 +548,56 @@ fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
         CheckMenuItemBuilder::new(label).id(id).checked(checked).build(app).unwrap();
 
     // ── Status ──
-    let status_label = if active { format!("Actif  {}  {}", "-", tor_ip) } else { "Inactif".into() };
+    let status_label = if active { format!("Active - {}", tor_ip) } else { "Inactive".into() };
     let item_status  = mkd("status", &status_label);
-    let item_real    = mkd("real_ip", &format!("IP reelle : {}  (masquee)", real_ip));
+    let item_real    = mkd("real_ip", &format!("Real IP: {}  (hidden)", real_ip));
 
     // ── Actions ──
-    let item_toggle  = mk("toggle",  if active { "Desactiver OPSEC" } else { "Activer OPSEC" });
-    let item_rotate  = MenuItemBuilder::new("Nouvelle identite Tor")
+    let item_toggle  = mk("toggle",  if active { "Disable OPSEC" } else { "Enable OPSEC" });
+    let item_rotate  = MenuItemBuilder::new("New Tor identity")
         .id("rotate").enabled(active).build(app).unwrap();
 
-    // ── Sous-menu Exit nodes ──
-    let sub_nodes = SubmenuBuilder::new(app, "Pays exclus (exit nodes)")
-        .item(&chk("node_us", "US  Etats-Unis",      cfg.exclude_us))
-        .item(&chk("node_gb", "GB  Royaume-Uni",     cfg.exclude_gb))
-        .item(&chk("node_au", "AU  Australie",       cfg.exclude_au))
-        .item(&chk("node_ca", "CA  Canada",           cfg.exclude_ca))
-        .item(&chk("node_nz", "NZ  Nouvelle-Zelande", cfg.exclude_nz))
-        .item(&chk("node_de", "DE  Allemagne",       cfg.exclude_de))
-        .item(&chk("node_fr", "FR  France",           cfg.exclude_fr))
+    // ── Exit nodes submenu ──
+    let sub_nodes = SubmenuBuilder::new(app, "Excluded exit nodes")
+        .item(&chk("node_us", "US  United States",   cfg.exclude_us))
+        .item(&chk("node_gb", "GB  United Kingdom",  cfg.exclude_gb))
+        .item(&chk("node_au", "AU  Australia",       cfg.exclude_au))
+        .item(&chk("node_ca", "CA  Canada",          cfg.exclude_ca))
+        .item(&chk("node_nz", "NZ  New Zealand",     cfg.exclude_nz))
+        .item(&chk("node_de", "DE  Germany",         cfg.exclude_de))
+        .item(&chk("node_fr", "FR  France",          cfg.exclude_fr))
         .build().unwrap();
 
-    // ── Sous-menu Rotation ──
+    // ── Rotation submenu ──
     let rot_label = match cfg.rotate_mins {
-        0   => "Rotation auto : desactivee",
-        5   => "Rotation auto : 5 min",
-        15  => "Rotation auto : 15 min",
-        30  => "Rotation auto : 30 min",
-        _   => "Rotation auto",
+        0   => "Auto-rotate: off",
+        5   => "Auto-rotate: 5 min",
+        15  => "Auto-rotate: 15 min",
+        30  => "Auto-rotate: 30 min",
+        _   => "Auto-rotate",
     };
     let sub_rotate = SubmenuBuilder::new(app, rot_label)
-        .item(&chk("rot_off", "Desactivee",          cfg.rotate_mins == 0))
-        .item(&chk("rot_5",   "Toutes les 5 min",  cfg.rotate_mins == 5))
-        .item(&chk("rot_15",  "Toutes les 15 min", cfg.rotate_mins == 15))
-        .item(&chk("rot_30",  "Toutes les 30 min", cfg.rotate_mins == 30))
+        .item(&chk("rot_off", "Off",            cfg.rotate_mins == 0))
+        .item(&chk("rot_5",   "Every 5 min",  cfg.rotate_mins == 5))
+        .item(&chk("rot_15",  "Every 15 min", cfg.rotate_mins == 15))
+        .item(&chk("rot_30",  "Every 30 min", cfg.rotate_mins == 30))
         .build().unwrap();
 
-    // ── Sous-menu Protections ──
+    // ── Protections submenu ──
     let sub_prot = SubmenuBuilder::new(app, "Protections")
-        .item(&chk("prot_ff",   "Firefox (proxy + WebRTC off)",   cfg.firefox))
-        .item(&chk("prot_rfp",  "Firefox resistFingerprinting", cfg.resist_fp))
-        .item(&chk("prot_mac",  "Spoofing MAC",                   cfg.mac_spoof))
-        .item(&chk("prot_dns",  "Anti DNS leak (dnsmasq)",       cfg.dns_leak))
+        .item(&chk("prot_ff",   "Firefox (proxy + WebRTC off)",  cfg.firefox))
+        .item(&chk("prot_rfp",  "Firefox resistFingerprinting",  cfg.resist_fp))
+        .item(&chk("prot_mac",  "MAC spoofing",                  cfg.mac_spoof))
+        .item(&chk("prot_dns",  "DNS leak fix (dnsmasq)",        cfg.dns_leak))
         .item(&chk("prot_pf",   "Kill switch (pf firewall)",     cfg.pf_firewall))
-        .item(&chk("prot_logs", "Effacer logs au demarrage",     cfg.clear_logs))
-        .item(&chk("prot_ua",   "User-Agent Windows/Firefox",    cfg.ua_spoof))
-        .item(&chk("prot_lang", "Langue neutre (en-US)",         cfg.lang_spoof))
+        .item(&chk("prot_logs", "Clear logs on start",           cfg.clear_logs))
+        .item(&chk("prot_ua",   "Spoof User-Agent (Windows)",    cfg.ua_spoof))
+        .item(&chk("prot_lang", "Neutral language (en-US)",      cfg.lang_spoof))
         .build().unwrap();
 
-    // ── Demarrage auto ──
+    // ── Launch at login ──
     let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
-    let item_login = chk("login", "Lancer au demarrage", autostart_on);
+    let item_login = chk("login", "Launch at login", autostart_on);
 
     let menu = MenuBuilder::new(app)
         .item(&item_status)
@@ -612,7 +612,7 @@ fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
         .separator()
         .item(&item_login)
         .separator()
-        .item(&mk("quit", "Quitter TorShield"))
+        .item(&mk("quit", "Quit TorShield"))
         .build().unwrap();
 
     if let Some(tray) = app.tray_by_id("main") {
