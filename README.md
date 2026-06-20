@@ -61,7 +61,7 @@ All toggleable from the menubar. Settings persist across restarts.
 | Firefox | on | Patches both `user.js` and the live `prefs.js` |
 | Firefox resistFingerprinting | off | Kills WebGL/canvas - breaks some sites |
 | MAC spoofing | on | Randomizes `en0` at session start |
-| DNS leak fix | on | Routes DNS through Tor via dnsmasq |
+| DNS leak fix | on | Routes DNS through Tor via dnsmasq (requires admin password once per session) |
 | pf kill switch | off | Blocks all non-Tor TCP outbound |
 | Clear logs on start | on | `log erase --all` + crash reporter |
 | User-Agent spoof | on | Generic Windows/Firefox UA |
