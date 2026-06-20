@@ -277,9 +277,9 @@ fn hw_mac(iface: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-// ifconfig ether necessite root sur macOS - elevation via osascript (une seule dialog admin)
+// ifconfig ether necessite root depuis macOS Ventura - elevation via osascript (une seule dialog admin)
 fn ifconfig_ether_root(iface: &str, mac: &str) {
-    // macOS Sequoia : desactivation Private Address + down/ether/up en une commande root
+    // down/ether/up en une seule commande root
     let script = format!(
         "do shell script \
          \"ifconfig {iface} down; sleep 0.3; ifconfig {iface} ether {mac}; ifconfig {iface} up\" \
