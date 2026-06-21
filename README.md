@@ -9,11 +9,11 @@
 
 </div>
 
-Menubar app for macOS that routes all your traffic through Tor in one click. System proxy, Firefox hardened, IPv6 off, MAC randomized. Quit and everything goes back to normal.
+Menubar app for macOS that routes all your traffic through Tor in one click. System proxy, Firefox hardened, IPv6 off, MAC randomized, browser fingerprint randomized. Quit and everything goes back to normal.
 
 Built for pentest engagements, red team ops, OSINT, and anyone who wants a clean anonymous session without configuring anything by hand.
 
-The typical workflow: open TorShield, enable OPSEC, do your thing, quit. Your real IP never hits the network, Firefox stops leaking WebRTC, your MAC rotates, DNS goes through Tor. When you quit, the machine is back to exactly how it was.
+The typical workflow: open TorShield, enable OPSEC, do your thing, quit. Your real IP never hits the network, Firefox stops leaking WebRTC, your MAC rotates, DNS goes through Tor, canvas and AudioContext are randomized on every domain. When you quit, the machine is back to exactly how it was.
 
 No window. No dock icon. Just a shield in your menubar.
 
@@ -47,6 +47,7 @@ When you enable OPSEC from the menubar:
 - Disables IPv6 on all interfaces (common leak vector even with a proxy)
 - Randomizes your MAC address on the primary interface
 - Patches Firefox directly: proxy configured, WebRTC disabled, geolocation blocked, User-Agent and Accept-Language overridden, dark mode preserved
+- Installs CanvasBlocker automatically so canvas, WebGL and AudioContext are randomized per domain - no manual extension setup
 - Optionally routes DNS through Tor via dnsmasq so mDNSResponder never leaks your real DNS queries
 - Optionally enables a `pf` kill switch that blocks all non-Tor TCP outbound
 
@@ -59,7 +60,7 @@ All toggleable from the menubar. Settings persist across restarts.
 | Toggle | Default | Note |
 |---|---|---|
 | Firefox | on | Patches both `user.js` and the live `prefs.js` |
-| Firefox resistFingerprinting | off | Kills WebGL/canvas - breaks some sites |
+| Firefox resistFingerprinting | on | Randomizes canvas, WebGL, AudioContext, timezone, screen size |
 | MAC spoofing | on | Randomizes `en0` at session start |
 | DNS leak fix | on | Routes DNS through Tor via dnsmasq (requires admin password once per session) |
 | pf kill switch | off | Blocks all non-Tor TCP outbound |

@@ -58,7 +58,7 @@ impl Default for Config {
             exclude_ca: true, exclude_nz: true, exclude_de: false, exclude_fr: false,
             rotate_mins: 0,
             mac_spoof: true, dns_leak: true, pf_firewall: false,
-            clear_logs: true, firefox: true, resist_fp: false,
+            clear_logs: true, firefox: true, resist_fp: true,
             ua_spoof: true, lang_spoof: true,
         }
     }
@@ -430,10 +430,15 @@ user_pref("layout.css.prefers-color-scheme.content-override", 1);
 user_pref("browser.startup.page", 3);
 "#);
     p.push_str(&format!(
-        "user_pref(\"privacy.resistFingerprinting\", {});\n",
-        if resist_fp { "true" } else { "false" }
+        "user_pref(\"privacy.resistFingerprinting\", {r});\n\
+         user_pref(\"privacy.resistFingerprinting.spoofOsAsWindows\", {r});\n\
+         user_pref(\"privacy.fingerprintingProtection\", {r});\n\
+         user_pref(\"privacy.fingerprintingProtection.overrides\", \"+AllTargets\");\n\
+         user_pref(\"dom.webaudio.enabled\", {w});\n",
+        r = if resist_fp { "true" } else { "false" },
+        w = if resist_fp { "false" } else { "true" }
     ));
-    if ua {
+    if ua && !resist_fp {
         p.push_str("user_pref(\"general.useragent.override\", \
             \"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) \
             Gecko/20100101 Firefox/128.0\");\n");
@@ -449,6 +454,30 @@ fn firefox_running() -> bool {
     // -ix : insensible a la casse, matche firefox et firefox-bin
     Command::new("pgrep").args(["-ix", "firefox"]).output()
         .map(|o| o.status.success()).unwrap_or(false)
+}
+
+const CANVASBLOCKER_ID: &str = "{bc3b3d9e-b4eb-41ae-b0b6-3de78bd66f6e}";
+const CANVASBLOCKER_URL: &str =
+    "https://addons.mozilla.org/firefox/downloads/latest/canvasblocker/latest.xpi";
+
+async fn ensure_canvasblocker(ff_profiles: &str) {
+    let xpi_cache = format!("{}/canvasblocker.xpi", opsec_dir());
+    if !std::path::Path::new(&xpi_cache).exists() {
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30)).build() else { return; };
+        let Ok(resp) = client.get(CANVASBLOCKER_URL).send().await else { return; };
+        let Ok(bytes) = resp.bytes().await else { return; };
+        std::fs::write(&xpi_cache, &bytes).ok();
+    }
+    for entry in std::fs::read_dir(ff_profiles).into_iter().flatten().flatten() {
+        if !entry.path().is_dir() { continue; }
+        let ext_dir = entry.path().join("extensions");
+        std::fs::create_dir_all(&ext_dir).ok();
+        let dest = ext_dir.join(format!("{}.xpi", CANVASBLOCKER_ID));
+        if !dest.exists() {
+            std::fs::copy(&xpi_cache, &dest).ok();
+        }
+    }
 }
 
 fn firefox_apply(enable: bool, cfg: &Config) {
@@ -467,8 +496,9 @@ fn firefox_apply(enable: bool, cfg: &Config) {
         "TorShield", "network.proxy", "media.peerconnection",
         "geo.", "permissions.default.geo", "dom.battery",
         "layout.css.prefers", "privacy.resistFingerprinting",
+        "privacy.fingerprintingProtection", "dom.webaudio.enabled",
         "general.useragent.override", "intl.accept_languages",
-        "javascript.use_us_english_locale",
+        "javascript.use_us_english_locale", "spoofOsAsWindows",
     ];
 
     for entry in std::fs::read_dir(&ff).into_iter().flatten().flatten() {
@@ -520,6 +550,7 @@ fn firefox_apply(enable: bool, cfg: &Config) {
             if let Ok(p) = std::fs::read_to_string(&pjs) {
                 let mut out = strip(&p);
                 out.push_str("\nuser_pref(\"layout.css.prefers-color-scheme.content-override\", 2);\n");
+                out.push_str("user_pref(\"privacy.resistFingerprinting\", false);\n");
                 std::fs::write(&pjs, out).ok();
             }
         }
@@ -555,7 +586,12 @@ async fn do_enable(shared: &Shared) {
     std::fs::create_dir_all(opsec_dir()).ok();
     std::fs::write(lock_path(), "").ok();
 
-    if cfg.firefox { firefox_apply(true, &cfg); }
+    if cfg.firefox {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let ff = format!("{}/Library/Application Support/Firefox/Profiles", home);
+        ensure_canvasblocker(&ff).await;
+        firefox_apply(true, &cfg);
+    }
 
     let tor_ip  = fetch_tor_ip().await;
     // fetch_real_ip bypass le proxy : si kill switch pf actif, retourne None (correct)
