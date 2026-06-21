@@ -7,102 +7,93 @@
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
+**One click. Full anonymity. No config.**
+
 </div>
 
-Menubar app for macOS that routes all your traffic through Tor in one click. System proxy, Firefox hardened, IPv6 off, MAC randomized, browser fingerprint randomized. Quit and everything goes back to normal.
+---
 
-Built for pentest engagements, red team ops, OSINT, and anyone who wants a clean anonymous session without configuring anything by hand.
-
-The typical workflow: open TorShield, enable OPSEC, do your thing, quit. Your real IP never hits the network, Firefox stops leaking WebRTC, your MAC rotates, DNS goes through Tor, canvas and AudioContext are randomized on every domain. When you quit, the machine is back to exactly how it was.
+TorShield is a macOS menubar app that routes everything through Tor the moment you enable it. IP hidden, DNS through Tor, MAC address randomized, Firefox hardened, browser fingerprint randomized. When you're done, quit — the machine goes back to exactly how it was.
 
 No window. No dock icon. Just a shield in your menubar.
+
+Built for pentest engagements, red team ops, OSINT, and anyone who needs a clean anonymous session without spending 30 minutes configuring things by hand.
 
 ## Requirements
 
 - macOS 13+
 - `brew install tor`
-- `brew install dnsmasq` *(optional, fixes DNS leaks)*
+- `brew install dnsmasq` *(optional — fixes DNS leaks)*
 
 ## Install
 
-Download the latest DMG from [Releases](https://github.com/mangetoncompost/torshield/releases), open it and drag TorShield to `/Applications`.
+Download the latest DMG from [Releases](https://github.com/mangetoncompost/torshield/releases), open it, drag TorShield to `/Applications`.
 
-### From source
-
-Requires Rust and the [Tauri CLI](https://tauri.app/start/prerequisites/).
+**From source**
 
 ```bash
 git clone https://github.com/mangetoncompost/torshield
-cd torshield
+cd torshield/src-tauri
 cargo tauri build
 ```
 
-App ends up in `src-tauri/target/release/bundle/macos/TorShield.app`.
+## What happens when you enable OPSEC
 
-## What it does
-
-When you enable OPSEC from the menubar:
-
-- Starts a local Tor daemon and sets it as system-wide SOCKS5 proxy via `networksetup` - covers Safari, Chrome, curl, every app that respects system proxy settings
-- Disables IPv6 on all interfaces (common leak vector even with a proxy)
-- Randomizes your MAC address on the primary interface
-- Patches Firefox directly: proxy configured, WebRTC disabled, geolocation blocked, User-Agent and Accept-Language overridden, dark mode preserved
-- Installs CanvasBlocker automatically so canvas, WebGL and AudioContext are randomized per domain - no manual extension setup
-- Optionally routes DNS through Tor via dnsmasq so mDNSResponder never leaks your real DNS queries
-- Optionally enables a `pf` kill switch that blocks all non-Tor TCP outbound
-
-When you quit, everything is restored: proxy removed, Firefox unpatched, IPv6 back, MAC restored.
+- Tor starts locally and becomes the system-wide SOCKS5 proxy — covers Safari, Chrome, curl, every app that respects macOS proxy settings
+- IPv6 disabled on all interfaces (it leaks even with a proxy if you leave it on)
+- MAC address randomized on the primary interface using a random Apple OUI
+- Firefox patched directly: proxy set, WebRTC killed, geolocation blocked, User-Agent and Accept-Language overridden
+- CanvasBlocker installed automatically in all Firefox profiles — canvas, WebGL and AudioContext are randomized per domain, no manual setup
+- DNS routed through Tor via dnsmasq so your real DNS resolver never sees your queries
+- Everything restored on quit: proxy off, Firefox unpatched, IPv6 back, MAC back
 
 ## Protections
 
-All toggleable from the menubar. Settings persist across restarts.
+All toggleable from the menubar. Saved across restarts.
 
-| Toggle | Default | Note |
+| Protection | Default | What it does |
 |---|---|---|
-| Firefox | on | Patches both `user.js` and the live `prefs.js` |
-| Firefox resistFingerprinting | on | Randomizes canvas, WebGL, AudioContext, timezone, screen size |
-| MAC spoofing | on | Randomizes `en0` at session start |
-| DNS leak fix | on | Routes DNS through Tor via dnsmasq (requires admin password once per session) |
-| pf kill switch | off | Blocks all non-Tor TCP outbound |
-| Clear logs on start | on | `log erase --all` + crash reporter |
-| User-Agent spoof | on | Generic Windows/Firefox UA |
-| Language (en-US) | on | Overrides Accept-Language header |
+| Firefox | on | Proxy, WebRTC off, geolocation blocked |
+| resistFingerprinting | on | Canvas, WebGL, AudioContext, timezone, screen size randomized |
+| MAC spoofing | on | New random Apple MAC every session |
+| DNS leak fix | on | DNS through Tor via dnsmasq (asks for admin password once) |
+| Kill switch | off | pf blocks all non-Tor TCP outbound |
+| Clear logs | on | `log erase --all` + crash reporter wiped on start |
+| Spoof User-Agent | on | Sends a generic Windows/Firefox UA |
+| Neutral language | on | Accept-Language forced to en-US |
 
 ## Bypass
 
-Some apps don't work well through Tor (rate limits, IP blocks, latency). TorShield lets you route specific services directly while keeping everything else anonymized.
+Some apps get blocked or throttled by Tor exit nodes. The Bypass submenu lets you send specific services direct while everything else stays behind Tor.
 
-Enable "Spotify (direct)" from the Bypass submenu — Spotify traffic skips the proxy entirely while your browser and all other apps stay behind Tor.
-
-Domains bypassed: `*.spotify.com`, `*.scdn.co`, `*.spotilocal.com`, `*.pscdn.co`.
+**Spotify** — enable "Spotify (direct)" and music works normally. Domains `*.spotify.com`, `*.scdn.co`, `*.spotilocal.com` and `*.pscdn.co` skip the proxy. Your browser stays on Tor.
 
 ## Exit nodes and rotation
 
-Exclude countries from Tor exit nodes (US, UK, AU, CA, NZ, DE, FR). Set automatic identity rotation every 5, 15 or 30 minutes, or rotate manually from the menu.
+Exclude countries from Tor exit nodes: US, UK, AU, CA, NZ, DE, FR. Rotate identity manually or automatically every 5, 15 or 30 minutes.
 
 ## How it works
 
 ```
-+-----------+    SOCKS5     +------------+    Tor network
-| Your apps | ------------> | Tor :9050  | ------------>  Internet
-+-----------+               +------------+
-      |                           |
- networksetup               DNSPort 9053
- (system-wide)              via dnsmasq
+your apps  -->  SOCKS5 :9050  -->  Tor  -->  internet
+               dnsmasq :53
+                    |
+               Tor DNSPort :9053
 ```
 
-Firefox is a special case because it doesn't always respect the system proxy for WebRTC and DNS. TorShield patches the profile directly (`user.js` for cold starts, `prefs.js` for the running session) so there are no gaps.
+Firefox is a special case — it doesn't always respect the system proxy for WebRTC and DNS. TorShield patches `user.js` and `prefs.js` directly so there are no gaps, then restores them on disable.
 
 ## Stack
 
-- [Tauri 2](https://tauri.app/) - native macOS tray app, no webview shown
-- Rust + tokio - async runtime, reqwest for IP checks over SOCKS5
-- SF Symbols rendered at runtime via ObjC + clang (no Xcode needed, CLI tools only)
-- tauri-plugin-autostart for LaunchAgent-based login item
+- [Tauri 2](https://tauri.app/) - native macOS tray app, zero webview
+- Rust + tokio - async runtime
+- reqwest for IP checks over SOCKS5
+- SF Symbols rendered at runtime via ObjC + clang (no Xcode required)
+- tauri-plugin-autostart for LaunchAgent login item
 
 ## Legal
 
-For authorized use only. Using this on systems you don't own or without explicit permission is illegal.
+For authorized use only. Pentest engagements, red team ops, OSINT, privacy research. Using this on systems you don't own or without explicit permission is illegal.
 
 ## License
 
