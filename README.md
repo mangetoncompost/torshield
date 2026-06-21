@@ -68,6 +68,14 @@ All toggleable from the menubar. Settings persist across restarts.
 | User-Agent spoof | on | Generic Windows/Firefox UA |
 | Language (en-US) | on | Overrides Accept-Language header |
 
+## Bypass
+
+Some apps don't work well through Tor (rate limits, IP blocks, latency). TorShield lets you route specific services directly while keeping everything else anonymized.
+
+Enable "Spotify (direct)" from the Bypass submenu — Spotify traffic skips the proxy entirely while your browser and all other apps stay behind Tor.
+
+Domains bypassed: `*.spotify.com`, `*.scdn.co`, `*.spotilocal.com`, `*.pscdn.co`.
+
 ## Exit nodes and rotation
 
 Exclude countries from Tor exit nodes (US, UK, AU, CA, NZ, DE, FR). Set automatic identity rotation every 5, 15 or 30 minutes, or rotate manually from the menu.
