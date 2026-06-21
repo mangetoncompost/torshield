@@ -46,9 +46,10 @@ pub struct Config {
     pub pf_firewall:  bool,
     pub clear_logs:   bool,
     pub firefox:      bool,
-    pub resist_fp:    bool,
-    pub ua_spoof:     bool,
-    pub lang_spoof:   bool,
+    pub resist_fp:      bool,
+    pub ua_spoof:       bool,
+    pub lang_spoof:     bool,
+    pub spotify_bypass: bool,
 }
 
 impl Default for Config {
@@ -59,7 +60,7 @@ impl Default for Config {
             rotate_mins: 0,
             mac_spoof: true, dns_leak: true, pf_firewall: false,
             clear_logs: true, firefox: true, resist_fp: true,
-            ua_spoof: true, lang_spoof: true,
+            ua_spoof: true, lang_spoof: true, spotify_bypass: false,
         }
     }
 }
@@ -241,10 +242,15 @@ fn new_tor_identity() -> bool {
 
 // ── Proxy systeme ─────────────────────────────────────────────────────────────
 
-fn proxy_enable() {
+const SPOTIFY_BYPASS_DOMAINS: &str =
+    "localhost, 127.0.0.1, *.spotify.com, *.scdn.co, *.spotilocal.com, *.pscdn.co";
+
+fn proxy_enable(spotify_bypass: bool) {
+    let bypass = if spotify_bypass { SPOTIFY_BYPASS_DOMAINS } else { "localhost, 127.0.0.1" };
     for svc in get_network_services() {
         sh("networksetup", &["-setsocksfirewallproxy", &svc, "127.0.0.1", "9050", "off"]);
         sh("networksetup", &["-setsocksfirewallproxystate", &svc, "on"]);
+        sh("networksetup", &["-setproxybypassdomains", &svc, bypass]);
     }
 }
 
@@ -576,7 +582,7 @@ async fn do_enable(shared: &Shared) {
         waited += 1;
     }
 
-    proxy_enable();
+    proxy_enable(cfg.spotify_bypass);
     ipv6_disable();
     if cfg.dns_leak    { dns_leak_enable(); }
     if cfg.pf_firewall { pf_enable(); }
@@ -683,6 +689,10 @@ fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
         .item(&chk("rot_30",  "Every 30 min", cfg.rotate_mins == 30))
         .build().unwrap();
 
+    let sub_bypass = SubmenuBuilder::new(app, "Bypass")
+        .item(&chk("prot_spotify", "Spotify (direct)",  cfg.spotify_bypass))
+        .build().unwrap();
+
     let sub_prot = SubmenuBuilder::new(app, "Protections")
         .item(&chk("prot_ff",   "Firefox (proxy + WebRTC off)", cfg.firefox))
         .item(&chk("prot_rfp",  "Firefox resistFingerprinting", cfg.resist_fp))
@@ -707,6 +717,7 @@ fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
         .item(&sub_nodes)
         .item(&sub_rotate)
         .item(&sub_prot)
+        .item(&sub_bypass)
         .separator()
         .item(&item_login)
         .separator()
@@ -834,6 +845,12 @@ pub fn run() {
                         "prot_logs" => { let cfg = toggle_cfg(&shared, |c| c.clear_logs  = !c.clear_logs);  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
                         "prot_ua"   => { let cfg = toggle_cfg(&shared, |c| c.ua_spoof    = !c.ua_spoof);    let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
                         "prot_lang" => { let cfg = toggle_cfg(&shared, |c| c.lang_spoof  = !c.lang_spoof);  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
+                        "prot_spotify" => {
+                            let cfg = toggle_cfg(&shared, |c| c.spotify_bypass = !c.spotify_bypass);
+                            let (state, _) = shared.lock().unwrap().clone();
+                            if state.active { proxy_enable(cfg.spotify_bypass); }
+                            rebuild_menu(&app, &state, &cfg);
+                        }
 
                         "login" => {
                             use tauri_plugin_autostart::ManagerExt;
