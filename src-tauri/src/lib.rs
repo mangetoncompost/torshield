@@ -503,6 +503,10 @@ fn build_pf_anchor_rules() -> String {
         "# TorShield kill switch anchor\n\
          # Loopback : Tor tourne sur 127.0.0.1 - ne jamais bloquer lo0\n\
          set skip on lo0\n\
+         # Bloquer iCloud Private Relay (Apple AS714 17.0.0.0/8)\n\
+         # Private Relay bypass le proxy systeme - doit etre bloque explicitement\n\
+         table <apple_relay> const {{ 17.0.0.0/8 }}\n\
+         block drop out quick on {iface} to <apple_relay>\n\
          # Bloquer tout le trafic sortant par defaut (fail-closed)\n\
          block drop out quick on {iface} all\n\
          # Bloquer tout UDP sortant : QUIC/HTTP3, WebRTC, mDNS, NTP\n\
@@ -528,10 +532,21 @@ fn pf_enable() {
     let pf_conf = std::fs::read_to_string("/etc/pf.conf").unwrap_or_default();
     if !pf_conf.contains(PF_ANCHOR) {
         let patched = format!("{}\n{}", pf_conf.trim_end(), pf_anchor_reference());
-        // Ecrire via ts_helper (root) dans un fichier tmp puis mv
-        let tmp = format!("{}/pf_conf_tmp", opsec_dir());
-        std::fs::write(&tmp, patched).ok();
-        root("/bin/mv", &[&tmp, "/etc/pf.conf"]);
+        // Ecrire via ts_helper tee (root) - plus sur que mv qui permettrait de
+        // deplacer n'importe quel fichier en root
+        let mut child = Command::new(TS_HELPER)
+            .args(["/usr/bin/tee", "/etc/pf.conf"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn().ok();
+        if let Some(ref mut c) = child {
+            if let Some(stdin) = c.stdin.take() {
+                use std::io::Write;
+                let mut s = stdin;
+                s.write_all(patched.as_bytes()).ok();
+            }
+            c.wait().ok();
+        }
     }
 
     // 3. Charger l'anchor et activer pf
@@ -623,6 +638,26 @@ fn clear_logs() {
 
 // ── Firefox hardening ─────────────────────────────────────────────────────────
 
+fn firefox_version() -> String {
+    // Detecte la version installée pour construire un UA toujours a jour
+    let ver = Command::new("/Applications/Firefox.app/Contents/MacOS/firefox")
+        .arg("--version").output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .or_else(|| {
+            Command::new("defaults")
+                .args(["read", "/Applications/Firefox.app/Contents/Info.plist",
+                       "CFBundleShortVersionString"])
+                .output().ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+        })
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    // Extraire "152.0.3" -> "152.0"
+    let maj_min: String = ver.split('.').take(2)
+        .collect::<Vec<_>>().join(".");
+    if maj_min.is_empty() { "128.0".to_string() } else { maj_min }
+}
+
 fn firefox_prefs(ua: bool, lang: bool, resist_fp: bool) -> String {
     let mut p = String::from(r#"
 // TorShield
@@ -655,9 +690,13 @@ user_pref("network.http.http2.enabled", true);
         w = if resist_fp { "false" } else { "true" }
     ));
     if ua && !resist_fp {
-        p.push_str("user_pref(\"general.useragent.override\", \
-            \"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) \
-            Gecko/20100101 Firefox/128.0\");\n");
+        let ver = firefox_version();
+        let rv  = ver.split('.').next().unwrap_or("128");
+        p.push_str(&format!(
+            "user_pref(\"general.useragent.override\", \
+             \"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{rv}.0) \
+             Gecko/20100101 Firefox/{ver}\");\n"
+        ));
     }
     if lang {
         p.push_str("user_pref(\"intl.accept_languages\", \"en-US, en\");\n");
@@ -742,9 +781,13 @@ fn firefox_apply(enable: bool, cfg: &Config) {
                 out.push_str(&format!("user_pref(\"privacy.resistFingerprinting\", {});\n",
                     if cfg.resist_fp { "true" } else { "false" }));
                 if cfg.ua_spoof {
-                    out.push_str("user_pref(\"general.useragent.override\", \
-                        \"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) \
-                        Gecko/20100101 Firefox/128.0\");\n");
+                    let ver = firefox_version();
+                    let rv  = ver.split('.').next().unwrap_or("128");
+                    out.push_str(&format!(
+                        "user_pref(\"general.useragent.override\", \
+                         \"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{rv}.0) \
+                         Gecko/20100101 Firefox/{ver}\");\n"
+                    ));
                 }
                 if cfg.lang_spoof {
                     out.push_str("user_pref(\"intl.accept_languages\", \"en-US, en\");\n");

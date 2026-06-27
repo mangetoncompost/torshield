@@ -10,7 +10,7 @@
 static const char* ALLOWED[] = {
     "/sbin/ifconfig",
     "/sbin/pfctl",
-    "/bin/mv",
+    "/usr/bin/tee",
     "/opt/homebrew/sbin/dnsmasq",
     "/usr/local/sbin/dnsmasq",
     "/usr/sbin/dnsmasq",
