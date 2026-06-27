@@ -5,7 +5,7 @@ use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder, CheckMenuItemBuilder},
     tray::TrayIconBuilder,
-    AppHandle,
+    AppHandle, Manager,
 };
 use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::watch;
@@ -49,7 +49,6 @@ pub struct Config {
     pub resist_fp:      bool,
     pub ua_spoof:       bool,
     pub lang_spoof:     bool,
-    pub spotify_bypass: bool,
     #[serde(default = "default_true")]
     pub env_inject:     bool,
 }
@@ -64,7 +63,7 @@ impl Default for Config {
             rotate_mins: 0,
             mac_spoof: true, dns_leak: true, pf_firewall: false,
             clear_logs: true, firefox: true, resist_fp: true,
-            ua_spoof: true, lang_spoof: true, spotify_bypass: false,
+            ua_spoof: true, lang_spoof: true,
             env_inject: true,
         }
     }
@@ -125,6 +124,61 @@ fn lock_path() -> String { format!("{}/active.lock", opsec_dir()) }
 
 fn sh(cmd: &str, args: &[&str]) {
     Command::new(cmd).args(args).output().ok();
+}
+
+// ── SUID helper auto-install ──────────────────────────────────────────────────
+
+fn helper_ok() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::path::Path::new(TS_HELPER);
+    match std::fs::metadata(path) {
+        Ok(m) => m.uid() == 0 && (m.mode() & 0o4000 != 0),
+        Err(_) => false,
+    }
+}
+
+fn ensure_helper(app: &tauri::App) {
+    if helper_ok() { return; }
+
+    // Localiser ts_helper.c dans les ressources du bundle
+    let c_src = app.path()
+        .resource_dir()
+        .ok()
+        .map(|d| d.join("ts_helper.c"))
+        .filter(|p| p.exists());
+
+    let src_path = match c_src {
+        Some(p) => p.to_string_lossy().to_string(),
+        None => {
+            // Fallback : ecrire le source depuis la constante embarquee
+            let fallback = format!("{}/ts_helper.c", opsec_dir());
+            std::fs::create_dir_all(opsec_dir()).ok();
+            std::fs::write(&fallback, include_str!("ts_helper.c")).ok();
+            fallback
+        }
+    };
+
+    let tmp_bin = format!("{}/ts_helper_tmp", opsec_dir());
+
+    // Compiler en binaire natif (clang est toujours present sur macOS avec Xcode CLT)
+    let compiled = Command::new("clang")
+        .args([&src_path, "-o", &tmp_bin])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !compiled { return; }
+
+    // Installer avec privileges admin - une seule dialog, jamais redemandee
+    let script = format!(
+        "do shell script \
+         \"cp '{tmp}' '{dst}' && chown root:wheel '{dst}' && chmod 4755 '{dst}'\" \
+         with administrator privileges",
+        tmp = tmp_bin.replace('\'', "'\\''"),
+        dst = TS_HELPER,
+    );
+    Command::new("osascript").args(["-e", &script]).output().ok();
+    std::fs::remove_file(&tmp_bin).ok();
 }
 
 // Retourne les services reseau actifs (filtre les desactives marques d'un *)
@@ -331,15 +385,11 @@ fn env_inject_disable() {
 
 // ── Proxy systeme ─────────────────────────────────────────────────────────────
 
-const SPOTIFY_BYPASS_DOMAINS: &str =
-    "localhost, 127.0.0.1, *.spotify.com, *.scdn.co, *.spotilocal.com, *.pscdn.co";
-
-fn proxy_enable(spotify_bypass: bool) {
-    let bypass = if spotify_bypass { SPOTIFY_BYPASS_DOMAINS } else { "localhost, 127.0.0.1" };
+fn proxy_enable() {
     for svc in get_network_services() {
         sh("networksetup", &["-setsocksfirewallproxy", &svc, "127.0.0.1", "9050", "off"]);
         sh("networksetup", &["-setsocksfirewallproxystate", &svc, "on"]);
-        sh("networksetup", &["-setproxybypassdomains", &svc, bypass]);
+        sh("networksetup", &["-setproxybypassdomains", &svc, "localhost, 127.0.0.1"]);
     }
 }
 
@@ -686,7 +736,7 @@ async fn do_enable(shared: &Shared) {
         waited += 1;
     }
 
-    proxy_enable(cfg.spotify_bypass);
+    proxy_enable();
     ipv6_disable();
     if cfg.dns_leak    { dns_leak_enable(); }
     if cfg.pf_firewall { pf_enable(); }
@@ -769,6 +819,25 @@ fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
     let item_status  = mkd("status",  &status_label);
     let item_real    = mkd("real_ip", &format!("Real IP: {}  (hidden)", real_ip));
 
+    // Sous-menu deps - etat de chaque dependance en temps reel
+    let tor_ok      = tor_ready();
+    let helper_ok_  = helper_ok();
+    let dnsmasq_bin = ["/opt/homebrew/sbin/dnsmasq", "/usr/local/sbin/dnsmasq", "/usr/sbin/dnsmasq"]
+        .iter().any(|p| std::path::Path::new(p).exists());
+    let clang_ok    = Command::new("clang").arg("--version").output()
+        .map(|o| o.status.success()).unwrap_or(false);
+
+    let sub_deps = SubmenuBuilder::new(app, "Dependencies")
+        .item(&mkd("dep_helper",  &format!("{} ts_helper (root commands)",
+            if helper_ok_ { "+" } else { "! install needed" })))
+        .item(&mkd("dep_tor",     &format!("{} tor",
+            if tor_ok      { "+" } else { "! brew install tor" })))
+        .item(&mkd("dep_dnsmasq", &format!("{} dnsmasq (DNS leak fix)",
+            if dnsmasq_bin { "+" } else { "! brew install dnsmasq" })))
+        .item(&mkd("dep_clang",   &format!("{} clang (helper compiler)",
+            if clang_ok    { "+" } else { "! xcode-select --install" })))
+        .build().unwrap();
+
     let item_toggle = mk("toggle", if active { "Disable OPSEC" } else { "Enable OPSEC" });
     let item_rotate = MenuItemBuilder::new("New Tor identity")
         .id("rotate").enabled(active).build(app).unwrap();
@@ -797,9 +866,6 @@ fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
         .item(&chk("rot_30",  "Every 30 min", cfg.rotate_mins == 30))
         .build().unwrap();
 
-    let sub_bypass = SubmenuBuilder::new(app, "Bypass")
-        .item(&chk("prot_spotify", "Spotify (direct)",  cfg.spotify_bypass))
-        .build().unwrap();
 
     let sub_prot = SubmenuBuilder::new(app, "Protections")
         .item(&chk("prot_ff",   "Firefox (proxy + WebRTC off)", cfg.firefox))
@@ -831,7 +897,7 @@ fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
         .item(&sub_rotate)
         .item(&sub_prot)
         .item(&sub_dev)
-        .item(&sub_bypass)
+        .item(&sub_deps)
         .separator()
         .item(&item_login)
         .separator()
@@ -880,6 +946,9 @@ pub fn run() {
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // Helper SUID - installe au premier lancement si absent (une seule dialog admin)
+            ensure_helper(app);
 
             // Icones dans ~/.config/opsec/ (hors /tmp)
             std::fs::create_dir_all(opsec_dir()).ok();
@@ -955,7 +1024,15 @@ pub fn run() {
                         }
                         "prot_mac"  => { let cfg = toggle_cfg(&shared, |c| c.mac_spoof   = !c.mac_spoof);   let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
                         "prot_dns"  => { let cfg = toggle_cfg(&shared, |c| c.dns_leak    = !c.dns_leak);    let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
-                        "prot_pf"   => { let cfg = toggle_cfg(&shared, |c| c.pf_firewall = !c.pf_firewall); let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
+                        "prot_pf"   => {
+                            let cfg = toggle_cfg(&shared, |c| c.pf_firewall = !c.pf_firewall);
+                            let (state, _) = shared.lock().unwrap().clone();
+                            if state.active {
+                                if cfg.pf_firewall { pf_enable(); }
+                                else               { pf_disable(); }
+                            }
+                            rebuild_menu(&app, &state, &cfg);
+                        }
                         "prot_logs" => { let cfg = toggle_cfg(&shared, |c| c.clear_logs  = !c.clear_logs);  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
                         "prot_ua"   => { let cfg = toggle_cfg(&shared, |c| c.ua_spoof    = !c.ua_spoof);    let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
                         "prot_lang" => { let cfg = toggle_cfg(&shared, |c| c.lang_spoof  = !c.lang_spoof);  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
@@ -966,12 +1043,6 @@ pub fn run() {
                                 if cfg.env_inject { env_inject_enable(); }
                                 else              { env_inject_disable(); }
                             }
-                            rebuild_menu(&app, &state, &cfg);
-                        }
-                        "prot_spotify" => {
-                            let cfg = toggle_cfg(&shared, |c| c.spotify_bypass = !c.spotify_bypass);
-                            let (state, _) = shared.lock().unwrap().clone();
-                            if state.active { proxy_enable(cfg.spotify_bypass); }
                             rebuild_menu(&app, &state, &cfg);
                         }
 
