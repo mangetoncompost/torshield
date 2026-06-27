@@ -49,11 +49,9 @@ pub struct Config {
     pub resist_fp:      bool,
     pub ua_spoof:       bool,
     pub lang_spoof:     bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub env_inject:     bool,
 }
-
-fn default_true() -> bool { true }
 
 impl Default for Config {
     fn default() -> Self {
@@ -64,7 +62,7 @@ impl Default for Config {
             mac_spoof: true, dns_leak: true, pf_firewall: false,
             clear_logs: true, firefox: true, resist_fp: true,
             ua_spoof: true, lang_spoof: true,
-            env_inject: true,
+            env_inject: false,
         }
     }
 }
@@ -317,8 +315,8 @@ fn env_inject_enable() {
          export http_proxy={proxy}\n\
          export https_proxy={proxy}\n\
          export all_proxy={proxy}\n\
-         export NO_PROXY=localhost,127.0.0.1,::1\n\
-         export no_proxy=localhost,127.0.0.1,::1\n"
+         export NO_PROXY=localhost,127.0.0.1,::1,github.com,api.github.com,*.github.com,*.anthropic.com,*.claude.ai\n\
+         export no_proxy=localhost,127.0.0.1,::1,github.com,api.github.com,*.github.com,*.anthropic.com,*.claude.ai\n"
     );
     std::fs::create_dir_all(opsec_dir()).ok();
     std::fs::write(env_file_path(), &content).ok();
@@ -333,8 +331,8 @@ fn env_inject_enable() {
         ("http_proxy",  proxy),
         ("https_proxy", proxy),
         ("all_proxy",   proxy),
-        ("NO_PROXY",    "localhost,127.0.0.1,::1"),
-        ("no_proxy",    "localhost,127.0.0.1,::1"),
+        ("NO_PROXY",    "localhost,127.0.0.1,::1,github.com,api.github.com,*.github.com,*.anthropic.com,*.claude.ai"),
+        ("no_proxy",    "localhost,127.0.0.1,::1,github.com,api.github.com,*.github.com,*.anthropic.com,*.claude.ai"),
     ] {
         Command::new("launchctl").args(["setenv", k, v]).output().ok();
     }
