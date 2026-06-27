@@ -50,7 +50,11 @@ pub struct Config {
     pub ua_spoof:       bool,
     pub lang_spoof:     bool,
     pub spotify_bypass: bool,
+    #[serde(default = "default_true")]
+    pub env_inject:     bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Default for Config {
     fn default() -> Self {
@@ -61,6 +65,7 @@ impl Default for Config {
             mac_spoof: true, dns_leak: true, pf_firewall: false,
             clear_logs: true, firefox: true, resist_fp: true,
             ua_spoof: true, lang_spoof: true, spotify_bypass: false,
+            env_inject: true,
         }
     }
 }
@@ -240,6 +245,90 @@ fn new_tor_identity() -> bool {
     resp.contains("250 OK")
 }
 
+// ── Env vars injection (Python/curl/wget/Go/Node — tout ce qui lit HTTP_PROXY) ─
+
+const ENV_MARKER_BEGIN: &str = "# TorShield-env-begin";
+const ENV_MARKER_END:   &str = "# TorShield-env-end";
+
+fn env_file_path() -> String { format!("{}/env.sh", opsec_dir()) }
+
+fn env_inject_enable() {
+    let proxy = "socks5h://127.0.0.1:9050";
+
+    // 1. Fichier env.sh — sourcé par le hook shell dans les nouveaux terminaux
+    let content = format!(
+        "export HTTP_PROXY={proxy}\n\
+         export HTTPS_PROXY={proxy}\n\
+         export ALL_PROXY={proxy}\n\
+         export http_proxy={proxy}\n\
+         export https_proxy={proxy}\n\
+         export all_proxy={proxy}\n\
+         export NO_PROXY=localhost,127.0.0.1,::1\n\
+         export no_proxy=localhost,127.0.0.1,::1\n"
+    );
+    std::fs::create_dir_all(opsec_dir()).ok();
+    std::fs::write(env_file_path(), &content).ok();
+
+    // 2. launchctl setenv — injecte dans l'espace de noms launchd, couvre
+    //    toutes les apps macOS (GUI, daemons utilisateur) qui héritent de l'env launchd.
+    //    Effet immédiat sur les apps lancées après l'injection.
+    for (k, v) in [
+        ("HTTP_PROXY",  proxy),
+        ("HTTPS_PROXY", proxy),
+        ("ALL_PROXY",   proxy),
+        ("http_proxy",  proxy),
+        ("https_proxy", proxy),
+        ("all_proxy",   proxy),
+        ("NO_PROXY",    "localhost,127.0.0.1,::1"),
+        ("no_proxy",    "localhost,127.0.0.1,::1"),
+    ] {
+        Command::new("launchctl").args(["setenv", k, v]).output().ok();
+    }
+
+    // 3. Hook shell dans ~/.zshrc et ~/.bashrc — source env.sh si TorShield est actif.
+    //    Couvre les nouveaux terminaux ouverts après activation.
+    //    On écrit le bloc une seule fois (idempotent via marqueur).
+    let hook = format!(
+        "\n{ENV_MARKER_BEGIN}\n\
+         [ -f \"{env}\" ] && source \"{env}\"\n\
+         {ENV_MARKER_END}\n",
+        env = env_file_path()
+    );
+    let home = std::env::var("HOME").unwrap_or_default();
+    for rc in [".zshrc", ".bashrc"] {
+        let path = format!("{home}/{rc}");
+        if let Ok(current) = std::fs::read_to_string(&path) {
+            if !current.contains(ENV_MARKER_BEGIN) {
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true).create(true).open(&path);
+                if let Ok(ref mut f) = f {
+                    use std::io::Write;
+                    f.write_all(hook.as_bytes()).ok();
+                }
+            }
+        } else {
+            // Fichier inexistant — le créer avec le hook uniquement
+            std::fs::write(&path, hook.trim_start()).ok();
+        }
+    }
+}
+
+fn env_inject_disable() {
+    // 1. Supprimer le fichier env.sh — les nouveaux terminaux n'auront plus rien à sourcer
+    std::fs::remove_file(env_file_path()).ok();
+
+    // 2. Désactiver via launchctl
+    for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+              "http_proxy", "https_proxy", "all_proxy",
+              "NO_PROXY",   "no_proxy"] {
+        Command::new("launchctl").args(["unsetenv", k]).output().ok();
+    }
+    // Le hook dans .zshrc/.bashrc source env.sh uniquement si le fichier existe —
+    // maintenant qu'il est supprimé, le source ne fait rien (commande silencieuse).
+    // On laisse le hook en place intentionnellement : propre, et évite de casser
+    // un .zshrc que l'utilisateur a peut-être modifié depuis.
+}
+
 // ── Proxy systeme ─────────────────────────────────────────────────────────────
 
 const SPOTIFY_BYPASS_DOMAINS: &str =
@@ -284,14 +373,19 @@ fn hw_mac(iface: &str) -> Option<String> {
 }
 
 // ifconfig ether necessite root depuis macOS Ventura - elevation via osascript (une seule dialog admin)
+const TS_HELPER: &str = "/usr/local/bin/ts_helper";
+
+fn root(cmd: &str, args: &[&str]) {
+    let mut full = vec![cmd];
+    full.extend_from_slice(args);
+    Command::new(TS_HELPER).args(&full).output().ok();
+}
+
 fn ifconfig_ether_root(iface: &str, mac: &str) {
-    // down/ether/up en une seule commande root
-    let script = format!(
-        "do shell script \
-         \"ifconfig {iface} down; sleep 0.3; ifconfig {iface} ether {mac}; ifconfig {iface} up\" \
-         with administrator privileges"
-    );
-    Command::new("osascript").args(["-e", &script]).output().ok();
+    root("/sbin/ifconfig", &[iface, "down"]);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    root("/sbin/ifconfig", &[iface, "ether", mac]);
+    root("/sbin/ifconfig", &[iface, "up"]);
 }
 
 fn mac_spoof_enable() {
@@ -329,16 +423,17 @@ fn dns_leak_enable() {
          pid-file={pid_file}\n"
     )).ok();
 
-    if !Command::new("which").arg("dnsmasq")
-        .output().map(|o| o.status.success()).unwrap_or(false) { return; }
+    // Chercher dnsmasq dans les paths homebrew et système
+    let dnsmasq_bin = [
+        "/opt/homebrew/sbin/dnsmasq",
+        "/usr/local/sbin/dnsmasq",
+        "/usr/sbin/dnsmasq",
+    ].iter().find(|p| std::path::Path::new(p).exists())
+        .map(|s| s.to_string());
 
-    // Port 53 requiert root - elevation via boite de dialogue macOS native.
-    // On echappe le path en remplacant les apostrophes pour eviter l'injection.
-    let safe_conf = dnsmasq_conf.replace('\'', "'\\''");
-    let script = format!(
-        "do shell script \"dnsmasq -C '{safe_conf}'\" with administrator privileges"
-    );
-    Command::new("osascript").args(["-e", &script]).output().ok();
+    let Some(bin) = dnsmasq_bin else { return; };
+
+    root(&bin, &["-C", &dnsmasq_conf]);
 
     for svc in get_network_services() {
         sh("networksetup", &["-setdnsservers", &svc, "127.0.0.1"]);
@@ -367,11 +462,17 @@ fn build_pf_rules() -> String {
         "# TorShield kill switch\n\
          set skip on lo0\n\
          block all\n\
+         # Tor SOCKS (TCP uniquement - SOCKS5 ne supporte pas UDP)\n\
          pass out on {iface} proto tcp to 127.0.0.1 port 9050 keep state\n\
          pass out on {iface} proto tcp to any port 9050 keep state\n\
-         pass out proto udp to any port 53 keep state\n\
+         # DNS via dnsmasq local (redirige vers Tor DNSPort)\n\
+         pass out proto udp to 127.0.0.1 port 53 keep state\n\
+         # Bloquer tout UDP sortant : QUIC/HTTP3, WebRTC, NTP, leaks divers\n\
+         block out proto udp all\n\
+         # Bloquer mDNS/Bonjour explicitement (224.0.0.251 et ff02::fb)\n\
          block out proto udp to 224.0.0.251 port 5353\n\
          block out proto udp to ff02::fb port 5353\n\
+         # Autoriser le trafic entrant (reponses aux connexions Tor etablies)\n\
          pass in all\n"
     )
 }
@@ -380,12 +481,12 @@ fn pf_enable() {
     let pf_conf   = format!("{}/pf.conf",        opsec_dir());
     let pf_backup = format!("{}/pf_backup.txt",  opsec_dir());
     std::fs::write(&pf_conf, build_pf_rules()).ok();
-    if let Ok(out) = Command::new("pfctl").args(["-sr"]).output() {
+    if let Ok(out) = Command::new(TS_HELPER).args(["/sbin/pfctl", "-sr"]).output() {
         if !out.stdout.is_empty() {
             std::fs::write(&pf_backup, &out.stdout).ok();
         }
     }
-    sh("pfctl", &["-f", &pf_conf, "-e"]);
+    root("/sbin/pfctl", &["-f", &pf_conf, "-e"]);
 }
 
 fn pf_disable() {
@@ -393,13 +494,13 @@ fn pf_disable() {
     let pf_conf   = format!("{}/pf.conf",       opsec_dir());
     if std::path::Path::new(&pf_backup).exists() {
         if std::fs::metadata(&pf_backup).map(|m| m.len() > 0).unwrap_or(false) {
-            sh("pfctl", &["-f", &pf_backup]);
+            root("/sbin/pfctl", &["-f", &pf_backup]);
         } else {
-            sh("pfctl", &["-d"]);
+            root("/sbin/pfctl", &["-d"]);
         }
         std::fs::remove_file(&pf_backup).ok();
     } else {
-        sh("pfctl", &["-d"]);
+        root("/sbin/pfctl", &["-d"]);
     }
     std::fs::remove_file(&pf_conf).ok();
 }
@@ -434,6 +535,8 @@ user_pref("permissions.default.geo", 2);
 user_pref("dom.battery.enabled", false);
 user_pref("layout.css.prefers-color-scheme.content-override", 1);
 user_pref("browser.startup.page", 3);
+user_pref("network.http.http3.enabled", false);
+user_pref("network.http.http2.enabled", true);
 "#);
     p.push_str(&format!(
         "user_pref(\"privacy.resistFingerprinting\", {r});\n\
@@ -505,6 +608,7 @@ fn firefox_apply(enable: bool, cfg: &Config) {
         "privacy.fingerprintingProtection", "dom.webaudio.enabled",
         "general.useragent.override", "intl.accept_languages",
         "javascript.use_us_english_locale", "spoofOsAsWindows",
+        "network.http.http3",
     ];
 
     for entry in std::fs::read_dir(&ff).into_iter().flatten().flatten() {
@@ -586,6 +690,7 @@ async fn do_enable(shared: &Shared) {
     ipv6_disable();
     if cfg.dns_leak    { dns_leak_enable(); }
     if cfg.pf_firewall { pf_enable(); }
+    if cfg.env_inject  { env_inject_enable(); }
 
     // Lock ecrit avant firefox_apply pour garantir le recovery meme si
     // l'app est tuee pendant la fermeture/reouverture de Firefox
@@ -614,6 +719,7 @@ async fn do_disable(shared: &Shared) {
 
     if cfg.pf_firewall { pf_disable(); }
     if cfg.dns_leak    { dns_leak_disable(); }
+    if cfg.env_inject  { env_inject_disable(); }
     proxy_disable();
     ipv6_restore();
     if cfg.firefox { firefox_apply(false, &cfg); }
@@ -634,6 +740,7 @@ async fn do_disable(shared: &Shared) {
 fn emergency_teardown(cfg: &Config) {
     if cfg.pf_firewall { pf_disable(); }
     if cfg.dns_leak    { dns_leak_disable(); }
+    if cfg.env_inject  { env_inject_disable(); }
     proxy_disable();
     ipv6_restore();
     if cfg.firefox     { firefox_apply(false, cfg); }
@@ -658,6 +765,7 @@ fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
         CheckMenuItemBuilder::new(label).id(id).checked(checked).build(app).unwrap();
 
     let status_label = if active { format!("Active - {}", tor_ip) } else { "Inactive".into() };
+    let version_label = format!("TorShield v{}", env!("CARGO_PKG_VERSION"));
     let item_status  = mkd("status",  &status_label);
     let item_real    = mkd("real_ip", &format!("Real IP: {}  (hidden)", real_ip));
 
@@ -701,13 +809,18 @@ fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
         .item(&chk("prot_pf",   "Kill switch (pf firewall)",    cfg.pf_firewall))
         .item(&chk("prot_logs", "Clear logs on start",          cfg.clear_logs))
         .item(&chk("prot_ua",   "Spoof User-Agent (Windows)",   cfg.ua_spoof))
-        .item(&chk("prot_lang", "Neutral language (en-US)",     cfg.lang_spoof))
+        .build().unwrap();
+
+    let sub_dev = SubmenuBuilder::new(app, "Dev / Scripts")
+        .item(&chk("prot_lang", "Neutral language (en-US)",        cfg.lang_spoof))
+        .item(&chk("prot_env",  "Env vars (Python/curl/wget/Go)",  cfg.env_inject))
         .build().unwrap();
 
     let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
     let item_login   = chk("login", "Launch at login", autostart_on);
 
     let menu = MenuBuilder::new(app)
+        .item(&mkd("version", &version_label))
         .item(&item_status)
         .item(&item_real)
         .separator()
@@ -717,6 +830,7 @@ fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
         .item(&sub_nodes)
         .item(&sub_rotate)
         .item(&sub_prot)
+        .item(&sub_dev)
         .item(&sub_bypass)
         .separator()
         .item(&item_login)
@@ -845,6 +959,15 @@ pub fn run() {
                         "prot_logs" => { let cfg = toggle_cfg(&shared, |c| c.clear_logs  = !c.clear_logs);  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
                         "prot_ua"   => { let cfg = toggle_cfg(&shared, |c| c.ua_spoof    = !c.ua_spoof);    let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
                         "prot_lang" => { let cfg = toggle_cfg(&shared, |c| c.lang_spoof  = !c.lang_spoof);  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
+                        "prot_env"  => {
+                            let cfg = toggle_cfg(&shared, |c| c.env_inject = !c.env_inject);
+                            let (state, _) = shared.lock().unwrap().clone();
+                            if state.active {
+                                if cfg.env_inject { env_inject_enable(); }
+                                else              { env_inject_disable(); }
+                            }
+                            rebuild_menu(&app, &state, &cfg);
+                        }
                         "prot_spotify" => {
                             let cfg = toggle_cfg(&shared, |c| c.spotify_bypass = !c.spotify_bypass);
                             let (state, _) = shared.lock().unwrap().clone();
