@@ -486,52 +486,130 @@ fn dns_leak_disable() {
     }
 }
 
-// ── pf firewall - kill switch ─────────────────────────────────────────────────
+// ── pf firewall - kill switch (architecture anchor Mullvad-style) ─────────────
+//
+// Les regles sont chargees dans un anchor isole "com.torshield.killswitch"
+// et non dans le ruleset principal - survivant aux updates macOS, rollback propre.
+// Un LaunchDaemon watchdog surveille TorShield et flush l'anchor si le process meurt.
 
-fn build_pf_rules() -> String {
+const PF_ANCHOR: &str = "com.torshield.killswitch";
+const PF_ANCHOR_PATH: &str = "/etc/pf.anchors/com.torshield.killswitch";
+const WATCHDOG_PLIST: &str = "/Library/LaunchDaemons/com.torshield.watchdog.plist";
+const WATCHDOG_SCRIPT: &str = "/usr/local/bin/torshield-watchdog";
+
+fn build_pf_anchor_rules() -> String {
     let iface = primary_interface();
     format!(
-        "# TorShield kill switch\n\
-         # Loopback : Tor tourne sur 127.0.0.1, ne jamais bloquer lo0\n\
+        "# TorShield kill switch anchor\n\
+         # Loopback : Tor tourne sur 127.0.0.1 - ne jamais bloquer lo0\n\
          set skip on lo0\n\
-         # Bloquer tout par defaut\n\
-         block out quick on {iface} all\n\
-         block in  quick on {iface} proto udp all\n\
-         # Autoriser TCP sortant vers Tor uniquement (port 9050 = SOCKS5)\n\
+         # Bloquer tout le trafic sortant par defaut (fail-closed)\n\
+         block drop out quick on {iface} all\n\
+         # Bloquer tout UDP sortant : QUIC/HTTP3, WebRTC, mDNS, NTP\n\
+         block drop out quick on {iface} proto udp all\n\
+         # Autoriser TCP sortant uniquement vers Tor SOCKS5\n\
          pass out quick on {iface} proto tcp to any port 9050 keep state\n\
-         # Bloquer UDP sortant : QUIC/HTTP3, WebRTC, mDNS, NTP\n\
-         block out quick on {iface} proto udp all\n\
-         # Autoriser le trafic entrant etabli (reponses aux connexions Tor)\n\
+         # Autoriser TCP entrant pour les reponses aux connexions Tor etablies\n\
          pass in quick on {iface} proto tcp keep state\n"
     )
 }
 
+fn pf_anchor_reference() -> String {
+    format!("anchor \"{PF_ANCHOR}\"\nload anchor \"{PF_ANCHOR}\" from \"{PF_ANCHOR_PATH}\"\n")
+}
+
 fn pf_enable() {
-    let pf_conf   = format!("{}/pf.conf",        opsec_dir());
-    let pf_backup = format!("{}/pf_backup.txt",  opsec_dir());
-    std::fs::write(&pf_conf, build_pf_rules()).ok();
-    if let Ok(out) = Command::new(TS_HELPER).args(["/sbin/pfctl", "-sr"]).output() {
-        if !out.stdout.is_empty() {
-            std::fs::write(&pf_backup, &out.stdout).ok();
-        }
+    let anchor_rules = build_pf_anchor_rules();
+
+    // 1. Ecrire les regles dans l'anchor file
+    std::fs::write(PF_ANCHOR_PATH, &anchor_rules).ok();
+
+    // 2. Verifier que /etc/pf.conf reference l'anchor - l'ajouter si absent
+    let pf_conf = std::fs::read_to_string("/etc/pf.conf").unwrap_or_default();
+    if !pf_conf.contains(PF_ANCHOR) {
+        let patched = format!("{}\n{}", pf_conf.trim_end(), pf_anchor_reference());
+        // Ecrire via ts_helper (root) dans un fichier tmp puis mv
+        let tmp = format!("{}/pf_conf_tmp", opsec_dir());
+        std::fs::write(&tmp, patched).ok();
+        root("/bin/mv", &[&tmp, "/etc/pf.conf"]);
     }
-    root("/sbin/pfctl", &["-f", &pf_conf, "-e"]);
+
+    // 3. Charger l'anchor et activer pf
+    root("/sbin/pfctl", &["-e"]);
+    root("/sbin/pfctl", &["-a", PF_ANCHOR, "-f", PF_ANCHOR_PATH]);
 }
 
 fn pf_disable() {
-    let pf_backup = format!("{}/pf_backup.txt", opsec_dir());
-    let pf_conf   = format!("{}/pf.conf",       opsec_dir());
-    if std::path::Path::new(&pf_backup).exists() {
-        if std::fs::metadata(&pf_backup).map(|m| m.len() > 0).unwrap_or(false) {
-            root("/sbin/pfctl", &["-f", &pf_backup]);
-        } else {
-            root("/sbin/pfctl", &["-d"]);
-        }
-        std::fs::remove_file(&pf_backup).ok();
-    } else {
-        root("/sbin/pfctl", &["-d"]);
+    // Flush l'anchor uniquement - ne touche pas aux regles Apple dans pf.conf
+    root("/sbin/pfctl", &["-a", PF_ANCHOR, "-F", "all"]);
+    // Supprimer le fichier anchor (cleanup)
+    let _ = std::fs::remove_file(PF_ANCHOR_PATH);
+}
+
+fn ensure_watchdog() {
+    // Script watchdog : surveille TorShield toutes les 5s, flush l'anchor si mort
+    let script = format!(
+        "#!/bin/sh\n\
+         # TorShield watchdog - flush le kill switch pf si TorShield n'est plus actif\n\
+         while true; do\n\
+           if ! pgrep -x torshield > /dev/null 2>&1; then\n\
+             /sbin/pfctl -a '{anchor}' -F all 2>/dev/null\n\
+           fi\n\
+           sleep 5\n\
+         done\n",
+        anchor = PF_ANCHOR
+    );
+
+    let plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\"><dict>\n\
+           <key>Label</key><string>com.torshield.watchdog</string>\n\
+           <key>ProgramArguments</key>\n\
+           <array><string>/bin/sh</string><string>{script}</string></array>\n\
+           <key>RunAtLoad</key><true/>\n\
+           <key>KeepAlive</key><true/>\n\
+           <key>StandardErrorPath</key><string>/dev/null</string>\n\
+           <key>StandardOutPath</key><string>/dev/null</string>\n\
+         </dict></plist>\n",
+        script = WATCHDOG_SCRIPT
+    );
+
+    let already_installed = std::path::Path::new(WATCHDOG_PLIST).exists()
+        && std::path::Path::new(WATCHDOG_SCRIPT).exists();
+    if already_installed { return; }
+
+    // Ecrire script + plist via osascript (admin)
+    let install_cmd = format!(
+        "do shell script \
+         \"printf '%s' {script_b64} | base64 -d > '{script_path}' && \
+          chmod 755 '{script_path}' && \
+          printf '%s' {plist_b64} | base64 -d > '{plist_path}' && \
+          launchctl load '{plist_path}'\" \
+         with administrator privileges",
+        script_b64 = base64_encode(script.as_bytes()),
+        script_path = WATCHDOG_SCRIPT,
+        plist_b64  = base64_encode(plist.as_bytes()),
+        plist_path = WATCHDOG_PLIST,
+    );
+    Command::new("osascript").args(["-e", &install_cmd]).output().ok();
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    use std::fmt::Write;
+    let b64_chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
+        let _ = write!(out, "{}", b64_chars[(b0 >> 2)] as char);
+        let _ = write!(out, "{}", b64_chars[((b0 & 3) << 4) | (b1 >> 4)] as char);
+        let _ = write!(out, "{}", if chunk.len() > 1 { b64_chars[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' });
+        let _ = write!(out, "{}", if chunk.len() > 2 { b64_chars[b2 & 0x3f] as char } else { '=' });
     }
-    std::fs::remove_file(&pf_conf).ok();
+    out
 }
 
 // ── Logs systeme ──────────────────────────────────────────────────────────────
@@ -929,9 +1007,11 @@ pub fn run() {
             // Helper SUID - installe au premier lancement si absent (une seule dialog admin)
             ensure_helper(app);
 
-            // Cleanup pf au demarrage - si TorShield a crashe ou le Mac a reboot
-            // avec le kill switch actif, pf_disable() remet les regles a zero
-            // pour eviter de bloquer le reseau sans TorShield actif
+            // Watchdog LaunchDaemon - surveille TorShield et flush l'anchor pf si mort
+            ensure_watchdog();
+
+            // Cleanup pf anchor au demarrage - flush les regles orphelines si TorShield
+            // a crashe (le watchdog prend le relais apres, mais on nettoie aussi au boot)
             pf_disable();
 
             // Icones dans ~/.config/opsec/ (hors /tmp)
