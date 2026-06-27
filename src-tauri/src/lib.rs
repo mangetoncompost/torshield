@@ -321,23 +321,7 @@ fn env_inject_enable() {
     std::fs::create_dir_all(opsec_dir()).ok();
     std::fs::write(env_file_path(), &content).ok();
 
-    // 2. launchctl setenv — injecte dans l'espace de noms launchd, couvre
-    //    toutes les apps macOS (GUI, daemons utilisateur) qui héritent de l'env launchd.
-    //    Effet immédiat sur les apps lancées après l'injection.
-    for (k, v) in [
-        ("HTTP_PROXY",  proxy),
-        ("HTTPS_PROXY", proxy),
-        ("ALL_PROXY",   proxy),
-        ("http_proxy",  proxy),
-        ("https_proxy", proxy),
-        ("all_proxy",   proxy),
-        ("NO_PROXY",    "localhost,127.0.0.1,::1,github.com,api.github.com,*.github.com,*.anthropic.com,*.claude.ai"),
-        ("no_proxy",    "localhost,127.0.0.1,::1,github.com,api.github.com,*.github.com,*.anthropic.com,*.claude.ai"),
-    ] {
-        Command::new("launchctl").args(["setenv", k, v]).output().ok();
-    }
-
-    // 3. Hook shell dans ~/.zshrc et ~/.bashrc — source env.sh si TorShield est actif.
+    // 2. Hook shell dans ~/.zshrc et ~/.bashrc — source env.sh si TorShield est actif.
     //    Couvre les nouveaux terminaux ouverts après activation.
     //    On écrit le bloc une seule fois (idempotent via marqueur).
     let hook = format!(
@@ -508,20 +492,17 @@ fn build_pf_rules() -> String {
     let iface = primary_interface();
     format!(
         "# TorShield kill switch\n\
+         # Loopback : Tor tourne sur 127.0.0.1, ne jamais bloquer lo0\n\
          set skip on lo0\n\
-         block all\n\
-         # Tor SOCKS (TCP uniquement - SOCKS5 ne supporte pas UDP)\n\
-         pass out on {iface} proto tcp to 127.0.0.1 port 9050 keep state\n\
-         pass out on {iface} proto tcp to any port 9050 keep state\n\
-         # DNS via dnsmasq local (redirige vers Tor DNSPort)\n\
-         pass out proto udp to 127.0.0.1 port 53 keep state\n\
-         # Bloquer tout UDP sortant : QUIC/HTTP3, WebRTC, NTP, leaks divers\n\
-         block out proto udp all\n\
-         # Bloquer mDNS/Bonjour explicitement (224.0.0.251 et ff02::fb)\n\
-         block out proto udp to 224.0.0.251 port 5353\n\
-         block out proto udp to ff02::fb port 5353\n\
-         # Autoriser le trafic entrant (reponses aux connexions Tor etablies)\n\
-         pass in all\n"
+         # Bloquer tout par defaut\n\
+         block out quick on {iface} all\n\
+         block in  quick on {iface} proto udp all\n\
+         # Autoriser TCP sortant vers Tor uniquement (port 9050 = SOCKS5)\n\
+         pass out quick on {iface} proto tcp to any port 9050 keep state\n\
+         # Bloquer UDP sortant : QUIC/HTTP3, WebRTC, mDNS, NTP\n\
+         block out quick on {iface} proto udp all\n\
+         # Autoriser le trafic entrant etabli (reponses aux connexions Tor)\n\
+         pass in quick on {iface} proto tcp keep state\n"
     )
 }
 
@@ -947,6 +928,11 @@ pub fn run() {
 
             // Helper SUID - installe au premier lancement si absent (une seule dialog admin)
             ensure_helper(app);
+
+            // Cleanup pf au demarrage - si TorShield a crashe ou le Mac a reboot
+            // avec le kill switch actif, pf_disable() remet les regles a zero
+            // pour eviter de bloquer le reseau sans TorShield actif
+            pf_disable();
 
             // Icones dans ~/.config/opsec/ (hors /tmp)
             std::fs::create_dir_all(opsec_dir()).ok();
