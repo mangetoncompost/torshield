@@ -2,106 +2,103 @@
 
 ## v0.6.0 - 2026-07-01
 
-Audit de securite complet. Toutes les modifications sont issues d'une veille
-sur les sources de reference (MITRE CWE, Apple Developer, Tor Project spec,
-GTFOBins, RustCrypto, PortSwigger).
+Full security audit. All changes are backed by reference sources (MITRE CWE,
+Apple Developer, Tor Project spec, GTFOBins, RustCrypto, PortSwigger).
 
-### Securite
+### Security
 
-- **SAFECOOKIE Tor** : le control port utilise desormais SAFECOOKIE (spec 193,
-  HMAC-SHA256 challenge/response) au lieu de COOKIE. Le fichier cookie n'est
-  plus envoye en clair sur le socket TCP - protection contre les replay attacks
-  sur 127.0.0.1:9051.
+- **SAFECOOKIE on Tor control port** : authentication now uses SAFECOOKIE
+  (spec 193, HMAC-SHA256 challenge/response) instead of plain COOKIE. The
+  cookie file is never sent in cleartext over the TCP socket - protects against
+  replay attacks on 127.0.0.1:9051.
 
-- **Integrite de la config** : torshield.json est maintenant signe par un
-  HMAC-SHA256 dont la cle est stockee dans le Keychain macOS. Toute alteration
-  externe (malware user-level, edition manuelle malveillante) est detectee au
-  chargement - la config est remise aux defaults plutot que d'etre appliquee
-  silencieusement.
+- **Config integrity** : torshield.json is now signed with HMAC-SHA256 using a
+  key stored in the macOS Keychain. Any external alteration (user-level malware,
+  malicious manual edit) is detected at load time - config is reset to defaults
+  instead of being silently applied.
 
-- **PRNG securise** : rand_bytes() remplace par getrandom::fill() qui appelle
-  directement getentropy(2) sur macOS. Le fallback horloge precedent produisait
-  des MAC addresses predictibles en cas d'erreur /dev/urandom.
+- **Secure PRNG** : rand_bytes() replaced by getrandom::fill() which calls
+  getentropy(2) directly on macOS. The previous clock fallback produced
+  predictable MAC addresses on /dev/urandom read failure.
 
-- **ts_helper SUID - tee supprime** : /usr/bin/tee etait dans la whitelist SUID.
-  GTFOBins documente tee SUID comme vecteur d'ecriture arbitraire root
-  (echo DATA | tee /etc/sudoers). Remplace par un verbe interne write-pf-conf
-  avec chemin /etc/pf.conf hardcode dans le C et O_NOFOLLOW sur open().
+- **ts_helper SUID - tee removed** : /usr/bin/tee was in the SUID whitelist.
+  GTFOBins documents tee-SUID as an arbitrary root file write vector
+  (echo DATA | tee /etc/sudoers). Replaced by an internal write-pf-conf verb
+  with /etc/pf.conf hardcoded in C and O_NOFOLLOW on open().
 
-- **ensure_helper() - symlink attack** : le binaire helper etait compile dans
-  opsec_dir() (accessible a l'utilisateur). Un attaquant pouvait remplacer le
-  fichier temporaire entre la compilation et le chown root+chmod 4755 via
-  osascript. Correction : compilation dans /tmp avec nom aleatoire non
-  predictible (tempfile + O_CREAT|O_EXCL), verification symlink_metadata()
-  post-compilation avant l'elevation.
+- **ensure_helper() - symlink attack** : the helper binary was compiled into
+  opsec_dir() (user-accessible). An attacker could replace the temp file
+  between compilation and the osascript-driven chown root + chmod 4755.
+  Fixed : compile into /tmp with an unpredictable random name (tempfile +
+  O_CREAT|O_EXCL), symlink_metadata() check post-compilation before elevation.
 
-- **pf anchor - table au bon endroit** : table <apple_relay> deplacee de
-  l'anchor file vers /etc/pf.conf. Les tables definies dans les anchors causent
-  des echecs silencieux au boot sur macOS (comportement OpenBSD non porte).
+- **pf anchor - table in the right place** : table <apple_relay> moved from the
+  anchor file into /etc/pf.conf. Tables defined inside anchors cause silent boot
+  failures on macOS (OpenBSD behaviour not ported).
   Source : iyanmv.medium.com/setting-up-correctly-packet-filter-pf-firewall.
 
-- **user.js - strip() precise** : la fonction de nettoyage des prefs Firefox
-  filtrait par substring (.contains()), supprimant les commentaires et prefs
-  tierces dont le nom contenait accidentellement un mot-cle bloque. Corrige :
-  filtrage par prefixe exact sur les lignes user_pref("...") uniquement.
+- **user.js - precise strip()** : the Firefox prefs cleanup function was
+  filtering by substring (.contains()), removing comments and third-party prefs
+  whose name accidentally contained a blocked keyword. Fixed : exact prefix
+  match on user_pref("...") lines only.
 
-- **CanvasBlocker via Tor** : le telechargement du XPI depuis addons.mozilla.org
-  passait en direct (IP reelle exposee). Corrige : proxy socks5h://127.0.0.1:9050
-  sur le client reqwest.
+- **CanvasBlocker downloaded via Tor** : the XPI download from
+  addons.mozilla.org was going direct (real IP exposed). Fixed : reqwest client
+  now uses socks5h://127.0.0.1:9050 proxy.
 
-### Dependances ajoutees
+### New dependencies
 
-- getrandom 0.3 - RustCrypto, backend getentropy macOS
-- hmac 0.13 - RustCrypto, 448M telechargements
-- sha2 0.11 - RustCrypto, 718M telechargements
-- tempfile 3 - deja dans le graphe transitif (tauri-bundler)
-- security-framework 3 - bindings Apple Security.framework, 292M telechargements
+- getrandom 0.3 - RustCrypto, getentropy backend on macOS
+- hmac 0.13 - RustCrypto, 448M downloads
+- sha2 0.11 - RustCrypto, 718M downloads
+- tempfile 3 - already in the transitive graph (tauri-bundler)
+- security-framework 3 - Apple Security.framework bindings, 292M downloads
 
 ---
 
-## v0.5.1 - 2026-06-xx
+## v0.5.1
 
-- User-Agent Firefox dynamique (detecte la version installee)
-- Blocage iCloud Private Relay (17.0.0.0/8) dans le kill switch pf
-- ts_helper securise (premiere version de la whitelist SUID)
+- Dynamic Firefox User-Agent (detects installed version)
+- iCloud Private Relay blocking (17.0.0.0/8) in pf kill switch
+- ts_helper SUID whitelist (first version)
 
 ## v0.5.0
 
-- Kill switch pf avec architecture anchor Mullvad-style
-- LaunchDaemon watchdog : flush l'anchor si TorShield crash
+- pf kill switch with Mullvad-style anchor architecture
+- LaunchDaemon watchdog : flushes anchor if TorShield crashes
 
 ## v0.4.1
 
-- Kill switch pf robuste
-- env_inject sans launchctl (hook zshrc uniquement)
-- env_inject desactive par defaut
-- NO_PROXY etendu (github, anthropic, claude.ai)
+- Robust pf kill switch
+- env_inject without launchctl (zshrc hook only)
+- env_inject disabled by default
+- NO_PROXY extended (github, anthropic, claude.ai)
 
 ## v0.4.0
 
-- Injection env vars (HTTP_PROXY/HTTPS_PROXY pour Python, curl, Go, Node)
-- SUID helper auto-installe (premiere version)
-- Blocage QUIC/HTTP3 dans pf
-- Menu Dependencies en temps reel
+- Env var injection (HTTP_PROXY/HTTPS_PROXY for Python, curl, Go, Node)
+- SUID helper auto-install (first version)
+- QUIC/HTTP3 blocking in pf
+- Real-time Dependencies menu
 
 ## v0.3.0
 
-- Hardening fingerprint Firefox (resistFingerprinting, spoofOsAsWindows)
-- CanvasBlocker installe automatiquement
-- Spoofing User-Agent Windows
-- Langue neutralisee (en-US)
+- Firefox fingerprint hardening (resistFingerprinting, spoofOsAsWindows)
+- CanvasBlocker auto-installed
+- Windows User-Agent spoofing
+- Language neutralization (en-US)
 
 ## v0.2.0
 
-- Interface en anglais
-- DNS leak fix via dnsmasq (port 9053 Tor)
-- MAC spoofing avec OUI Apple legitimes
-- Rotation automatique d'identite Tor (5/15/30 min)
+- English UI
+- DNS leak fix via dnsmasq (Tor port 9053)
+- MAC spoofing with legitimate Apple OUIs
+- Automatic Tor identity rotation (5/15/30 min)
 
 ## v0.1.0
 
-- Premiere version : app menubar macOS native (Tauri 2)
-- Proxy SOCKS5 systeme via Tor
-- Desactivation IPv6
-- Effacement des logs systeme
-- Exclusion de noeuds de sortie par pays
+- First release : native macOS menubar app (Tauri 2)
+- System-wide SOCKS5 proxy via Tor
+- IPv6 disable
+- System log clearing
+- Exit node exclusion by country
