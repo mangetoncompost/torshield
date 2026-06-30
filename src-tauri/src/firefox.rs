@@ -47,6 +47,11 @@ user_pref("layout.css.prefers-color-scheme.content-override", 1);
 user_pref("browser.startup.page", 3);
 user_pref("network.http.http3.enabled", false);
 user_pref("network.http.http2.enabled", true);
+user_pref("network.dns.disablePrefetch", true);
+user_pref("network.dns.disablePrefetchFromHTTPS", true);
+user_pref("network.prefetch-next", false);
+user_pref("browser.send_pings", false);
+user_pref("media.navigator.enabled", false);
 "#);
     p.push_str(&format!(
         "user_pref(\"privacy.resistFingerprinting\", {r});\n\
@@ -118,7 +123,10 @@ pub fn firefox_apply(enable: bool, cfg: &Config) {
         "privacy.fingerprintingProtection", "dom.webaudio.enabled",
         "general.useragent.override", "intl.accept_languages",
         "javascript.use_us_english_locale", "spoofOsAsWindows",
-        "network.http.http3",
+        "network.http.http3", "network.http.http2.enabled",
+        "network.dns.disablePrefetch", "network.prefetch-next",
+        "browser.send_pings", "media.navigator.enabled",
+        "browser.startup.page",
     ];
 
     // Exact prefix match on user_pref("...") lines only - avoids stripping

@@ -79,6 +79,54 @@ pub fn ipv6_restore() {
     for svc in get_network_services() { sh("networksetup", &["-setv6automatic", &svc]); }
 }
 
+pub fn hostname_anonymize() {
+    let dir = opsec_dir();
+    // Save current names before overwriting
+    for (key, file) in [
+        ("LocalHostName",  "local_hostname.bak"),
+        ("ComputerName",   "computer_name.bak"),
+        ("HostName",       "hostname.bak"),
+    ] {
+        let out = Command::new("scutil").args(["--get", key]).output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if !out.is_empty() {
+            std::fs::write(format!("{dir}/{file}"), &out).ok();
+        }
+    }
+    // Replace with neutral names - mDNSResponder picks up changes immediately
+    let script = "do shell script \
+        \"scutil --set LocalHostName 'anonymous' && \
+          scutil --set ComputerName 'MacBook' && \
+          scutil --set HostName 'anonymous'\" \
+        with administrator privileges";
+    Command::new("osascript").args(["-e", script]).output().ok();
+}
+
+pub fn hostname_restore() {
+    let dir = opsec_dir();
+    for (key, file) in [
+        ("LocalHostName",  "local_hostname.bak"),
+        ("ComputerName",   "computer_name.bak"),
+        ("HostName",       "hostname.bak"),
+    ] {
+        let path = format!("{dir}/{file}");
+        if let Ok(val) = std::fs::read_to_string(&path) {
+            let val = val.trim();
+            if !val.is_empty() {
+                let script = format!(
+                    "do shell script \"scutil --set {key} '{val}'\" with administrator privileges",
+                    key = key,
+                    val = val.replace('\'', "'\\''"),
+                );
+                Command::new("osascript").args(["-e", &script]).output().ok();
+            }
+            std::fs::remove_file(&path).ok();
+        }
+    }
+}
+
 pub fn dns_leak_enable() {
     let dir          = opsec_dir();
     let pid_file     = format!("{}/dnsmasq.pid", dir);

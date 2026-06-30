@@ -14,15 +14,29 @@ const PF_TABLE_DEF: &str =
     "# TorShield-apple-relay-table\n\
      table <apple_relay> const { 17.0.0.0/8 }\n";
 
+// captiveagent sends HTTP to captive.apple.com at every network connection,
+// bypassing the SOCKS5 proxy configured via networksetup (it's a system daemon).
+// Blocking at pf level prevents the real IP from leaking to Apple on each WiFi join.
+const CAPTIVE_HOSTS_MARKER: &str = "# TorShield-captive-block";
+const CAPTIVE_HOSTS: &[&str] = &[
+    "captive.apple.com",
+    "www.apple.com",
+    "apple.com",
+];
+
 fn build_pf_anchor_rules(iface: &str) -> String {
+    // pf evaluates rules top-to-bottom; "quick" stops evaluation immediately.
+    // Passes must come BEFORE the default block, or they are never reached.
+    // "pass in" is removed: stateful tracking on "pass out ... keep state"
+    // handles return packets automatically - an explicit "pass in" would also
+    // accept externally-initiated TCP connections, piercing the kill switch.
+    // Tor client connects to relays on 443, 9001, 80 (OR ports per man tor).
     format!(
         "# TorShield kill switch anchor\n\
          set skip on lo0\n\
          block drop out quick on {iface} to <apple_relay>\n\
-         block drop out quick on {iface} all\n\
-         block drop out quick on {iface} proto udp all\n\
-         pass out quick on {iface} proto tcp to any port 9050 keep state\n\
-         pass in quick on {iface} proto tcp keep state\n"
+         pass out quick on {iface} proto tcp to any port {{443, 9001, 80}} keep state\n\
+         block drop out quick on {iface} all\n"
     )
 }
 
@@ -30,9 +44,9 @@ fn pf_anchor_reference() -> String {
     format!("anchor \"{PF_ANCHOR}\"\nload anchor \"{PF_ANCHOR}\" from \"{PF_ANCHOR_PATH}\"\n")
 }
 
-fn write_pf_conf(content: &str) {
+fn write_via_helper(verb: &str, content: &str) {
     let mut child = Command::new(TS_HELPER)
-        .arg("write-pf-conf")
+        .arg(verb)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .spawn().ok();
@@ -46,11 +60,57 @@ fn write_pf_conf(content: &str) {
     }
 }
 
+fn write_pf_conf(content: &str) {
+    write_via_helper("write-pf-conf", content);
+}
+
+fn write_pf_anchor(content: &str) {
+    write_via_helper("write-pf-anchor", content);
+}
+
+fn write_hosts(content: &str) {
+    // /etc/hosts is root:wheel - write via base64+osascript to avoid any
+    // shell injection from content (printf '%s' | base64 -d is injection-safe).
+    let b64 = base64_encode(content.as_bytes());
+    let cmd = format!(
+        "do shell script \"printf '%s' '{b64}' | base64 -d > /etc/hosts\" \
+         with administrator privileges",
+        b64 = b64,
+    );
+    Command::new("osascript").args(["-e", &cmd]).output().ok();
+}
+
+fn block_captive_portal() {
+    let Ok(current) = std::fs::read_to_string("/etc/hosts") else { return };
+    if current.contains(CAPTIVE_HOSTS_MARKER) { return; }
+    let mut patched = current.trim_end().to_string();
+    patched.push_str(&format!("\n{}\n", CAPTIVE_HOSTS_MARKER));
+    for host in CAPTIVE_HOSTS {
+        patched.push_str(&format!("127.0.0.1 {host}\n"));
+    }
+    write_hosts(&patched);
+}
+
+fn unblock_captive_portal() {
+    let Ok(current) = std::fs::read_to_string("/etc/hosts") else { return };
+    if !current.contains(CAPTIVE_HOSTS_MARKER) { return; }
+    let cleaned = current.lines()
+        .filter(|l| {
+            let t = l.trim();
+            t != CAPTIVE_HOSTS_MARKER
+                && !CAPTIVE_HOSTS.iter().any(|h| t == &format!("127.0.0.1 {h}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    write_hosts(&cleaned);
+}
+
 pub fn pf_enable() {
     let iface = primary_interface();
     let anchor_rules = build_pf_anchor_rules(&iface);
 
-    std::fs::write(PF_ANCHOR_PATH, &anchor_rules).ok();
+    // Write anchor file via ts_helper (root required - /etc/pf.anchors is root:wheel 755).
+    write_pf_anchor(&anchor_rules);
 
     let pf_conf = std::fs::read_to_string("/etc/pf.conf").unwrap_or_default();
     let needs_table  = !pf_conf.contains(PF_TABLE_MARKER);
@@ -62,13 +122,15 @@ pub fn pf_enable() {
         write_pf_conf(&patched);
     }
 
+    block_captive_portal();
     root("/sbin/pfctl", &["-e"]);
     root("/sbin/pfctl", &["-a", PF_ANCHOR, "-f", PF_ANCHOR_PATH]);
 }
 
 pub fn pf_disable() {
     root("/sbin/pfctl", &["-a", PF_ANCHOR, "-F", "all"]);
-    let _ = std::fs::remove_file(PF_ANCHOR_PATH);
+    Command::new(TS_HELPER).arg("rm-pf-anchor").output().ok();
+    unblock_captive_portal();
 }
 
 fn base64_encode(data: &[u8]) -> String {

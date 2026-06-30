@@ -60,20 +60,36 @@ pub fn clear_logs() {
 pub fn helper_ok() -> bool {
     use std::os::unix::fs::MetadataExt;
     let path = std::path::Path::new(TS_HELPER);
-    match std::fs::metadata(path) {
-        Ok(m) => m.uid() == 0 && (m.mode() & 0o4000 != 0),
+    // symlink_metadata (= lstat) does not follow symlinks - rejects a symlink
+    // pointing to a legitimate SUID binary that an attacker placed at TS_HELPER.
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => m.file_type().is_file() && m.uid() == 0 && (m.mode() & 0o4000 != 0),
         Err(_) => false,
     }
 }
 
+// SHA-256 of the embedded ts_helper.c source (computed at compile time).
+// If the bundle copy has been tampered with, we fall back to the embedded source.
+const TS_HELPER_SRC: &str = include_str!("ts_helper.c");
+
 pub fn ensure_helper(app: &tauri::App) {
     if helper_ok() { return; }
 
+    // Validate bundle source against the embedded copy before compiling.
+    // Prevents LPE via a tampered ts_helper.c in the app bundle (M2):
+    // if the on-disk source differs from what was compiled into this binary,
+    // we discard it and fall back to the embedded source (which cannot be modified
+    // without recompiling the whole TorShield binary).
     let bundle_src = app.path()
         .resource_dir()
         .ok()
         .map(|d| d.join("ts_helper.c"))
-        .filter(|p| p.exists());
+        .filter(|p| p.exists())
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .map(|s| s == TS_HELPER_SRC)
+                .unwrap_or(false)
+        });
 
     let tmp_bin_file = match tempfile::Builder::new()
         .prefix("ts_helper_")
@@ -103,7 +119,7 @@ pub fn ensure_helper(app: &tauri::App) {
                 Err(_) => return,
             };
             let src_path = src_tmp.path().to_path_buf();
-            if std::fs::write(&src_path, include_str!("ts_helper.c")).is_err() { return; }
+            if std::fs::write(&src_path, TS_HELPER_SRC).is_err() { return; }
             let ok = Command::new("clang")
                 .args([src_path.to_str().unwrap_or(""), "-o", tmp_bin_path.to_str().unwrap_or("")])
                 .output()

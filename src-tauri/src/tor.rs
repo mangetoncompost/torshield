@@ -37,6 +37,10 @@ pub fn start_tor(cfg: &Config) -> bool {
          DataDirectory {data}\nLog notice file {log}\n\
          DNSPort 9053\nMaxCircuitDirtiness 600\n{exclude_line}"
     )).ok();
+    // Restrict torrc to owner-only: prevents local modification of exit node
+    // exclusions, CookieAuthFile path, or injection of HiddenServiceDir.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o600)).ok();
     Command::new("tor")
         .args(["-f", &conf, "--PidFile", &pid, "--RunAsDaemon", "1"])
         .spawn().is_ok()
@@ -44,7 +48,9 @@ pub fn start_tor(cfg: &Config) -> bool {
 
 pub fn stop_tor() {
     if let Some(pid) = tor_pid() {
-        Command::new("kill").arg(pid.to_string()).output().ok();
+        // tor runs as the current user - kill directly with /bin/kill (absolute path,
+        // required by execv which does not search PATH).
+        Command::new("/bin/kill").arg(pid.to_string()).output().ok();
         for _ in 0..30 {
             std::thread::sleep(std::time::Duration::from_millis(100));
             if tor_pid().is_none() { break; }
@@ -94,9 +100,8 @@ pub fn new_tor_identity() -> bool {
         .nth(1).and_then(|s| s.split_whitespace().next().map(|s| s.trim_end_matches("\r\n")))
         .unwrap_or("");
 
-    let server_hash  = hex_decode(server_hash_hex);
-    let server_nonce = hex_decode(server_nonce_hex);
-    if server_hash.len() != 32 || server_nonce.len() != 32 { return false; }
+    let server_hash  = match hex_decode(server_hash_hex)  { Some(v) if v.len() == 32 => v, _ => return false };
+    let server_nonce = match hex_decode(server_nonce_hex) { Some(v) if v.len() == 32 => v, _ => return false };
 
     let server_key = b"Tor safe cookie authentication server-to-controller hash";
     let mut mac_srv = HmacSha256::new_from_slice(server_key).unwrap();
@@ -122,9 +127,14 @@ pub fn new_tor_identity() -> bool {
     resp.contains("250 OK")
 }
 
-fn hex_decode(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2)
-        .filter_map(|i| u8::from_str_radix(&s[i..i+2], 16).ok())
+// Returns None on odd-length input or invalid hex - never panics.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 { return None; }
+    s.as_bytes().chunks(2)
+        .map(|c| {
+            let h = std::str::from_utf8(c).ok()?;
+            u8::from_str_radix(h, 16).ok()
+        })
         .collect()
 }
 
@@ -135,8 +145,13 @@ pub async fn fetch_tor_ip() -> Option<String> {
     client.get("https://api.ipify.org").send().await.ok()?.text().await.ok()
 }
 
-pub async fn fetch_real_ip() -> Option<String> {
-    reqwest::Client::builder().no_proxy()
-        .timeout(std::time::Duration::from_secs(5)).build().ok()?
-        .get("https://api.ipify.org").send().await.ok()?.text().await.ok()
+// Read the real IP from the default interface without any outbound network request.
+// Avoids exposing the real IP to api.ipify.org at startup before Tor is active.
+pub fn local_real_ip() -> Option<String> {
+    let out = std::process::Command::new("ipconfig")
+        .args(["getifaddr", &crate::helper::primary_interface()])
+        .output().ok()?;
+    let s = String::from_utf8(out.stdout).ok()?;
+    let ip = s.trim().to_string();
+    if ip.is_empty() { None } else { Some(ip) }
 }

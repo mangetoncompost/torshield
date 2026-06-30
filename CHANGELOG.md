@@ -102,3 +102,86 @@ Apple Developer, Tor Project spec, GTFOBins, RustCrypto, PortSwigger).
 - IPv6 disable
 - System log clearing
 - Exit node exclusion by country
+
+---
+
+## v0.7.0 - 2026-07-01
+
+Second security audit. All findings confirmed with reference sources before implementation.
+
+### Security - Critical
+
+- **pf kill switch: rule order fixed** : `block drop out quick ... all` was placed
+  before `pass out quick` rules. With `quick`, the first matching rule stops evaluation
+  immediately (man pf.conf). The pass rules were never reached - Tor could not connect
+  to relays and the kill switch was silently broken.
+
+- **pf anchor written via ts_helper** : `pf_enable()` was calling `std::fs::write()`
+  on `/etc/pf.anchors/` (root:wheel 755) and silently absorbing the `Permission denied`
+  error via `.ok()`. The anchor file was never created; pfctl loaded a non-existent file
+  and failed silently. The kill switch showed as active in the UI with no rules loaded.
+  Fixed: new `write-pf-anchor` and `rm-pf-anchor` verbs in ts_helper with O_NOFOLLOW.
+
+### Security - High
+
+- **`pass in quick tcp` removed** : the rule accepted externally-initiated TCP
+  connections, piercing the kill switch. Stateful tracking on `pass out ... keep state`
+  handles return packets automatically without an explicit `pass in` rule.
+
+- **Tor relay ports added to pf** : only port 9050 (SOCKS local) was allowed outbound.
+  Tor connects to relays on 443, 9001 and 80 (ORPort per man tor). Without these ports,
+  Tor could not bootstrap when the kill switch was active.
+
+- **`/bin/kill` absolute path in ts_helper** : `execv("kill", ...)` fails with ENOENT
+  because execv does not search PATH (man execv(2)). dnsmasq was never killed by PID;
+  the pkill fallback was killing all dnsmasq instances on the system.
+
+- **`hex_decode()` panic on odd-length input fixed** : `&s[i..i+2]` panics in release
+  build when len is odd. A malformed response from a compromised Tor daemon would crash
+  TorShield, triggering the watchdog to flush the pf anchor and exposing the real IP.
+  Fixed: returns `Option<Vec<u8>>`, rejects odd-length input explicitly.
+
+- **IPv6 disabled before MAC spoof** : `ifconfig down/up` triggers NDP Router
+  Solicitations that may expose the fe80:: link-local address (EUI-64 derived from MAC)
+  on the local segment (RFC 4861 s.6.3.7, RFC 4941). IPv6 is now disabled first.
+
+### Security - Medium
+
+- **No outbound request at startup** : `fetch_real_ip()` called `reqwest::no_proxy()`
+  which "disables the automatic usage of the system proxy" (docs.rs/reqwest). The real
+  IP was sent to api.ipify.org at every startup, before Tor was active. Replaced by
+  `local_real_ip()` which reads the interface address via `ipconfig getifaddr` (no
+  network request).
+
+- **ts_helper.c bundle integrity check** : the source file in the app bundle is owned
+  by the user and can be modified. `ensure_helper()` now compares the on-disk source
+  against the copy embedded in the binary at compile time. A tampered bundle source is
+  discarded; the embedded source is used instead, preventing LPE via recompilation.
+
+- **torrc permissions 600** : torrc was world-readable (644). Restricted to owner-only
+  to prevent local modification of ExcludeExitNodes, CookieAuthFile, or injection of
+  HiddenServiceDir between activations.
+
+- **Captive portal blocked** : `captiveagent` sends HTTP to `captive.apple.com` at
+  every network connection, bypassing the SOCKS5 proxy (Apple system daemon). The
+  TorShield pf kill switch now blocks this host via `/etc/hosts` (base64+osascript,
+  injection-safe) when the kill switch is enabled.
+
+- **mDNS hostname anonymized** : `mDNSResponder` broadcasts the real hostname
+  (`MacBook-Pro-de-[Name].local`), exact model, and macOS version on the local network
+  spontaneously (Fingerprint.com: 65% first-name identification rate). TorShield now
+  sets LocalHostName/ComputerName/HostName to neutral values at enable and restores the
+  originals at disable via scutil.
+
+- **`helper_ok()` uses `symlink_metadata()`** : `std::fs::metadata()` follows symlinks,
+  returning `is_file() = true` for a symlink to a file. A symlink at `/usr/local/bin/ts_helper`
+  pointing to a legitimate SUID binary would have passed the check. Fixed: uses
+  `symlink_metadata()` (= lstat) and checks `file_type().is_file()` directly.
+
+### Firefox
+
+- **DNS prefetch disabled** : `network.dns.disablePrefetch` and
+  `network.dns.disablePrefetchFromHTTPS` added (the latter defaults to `false` since
+  Firefox 127 - arkenfox issue #1860). Prefetch lookups bypass the SOCKS5 proxy.
+  Also added: `network.prefetch-next`, `browser.send_pings`, `media.navigator.enabled`.
+  All new prefs added to the cleanup list on disable.

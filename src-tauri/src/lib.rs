@@ -19,13 +19,18 @@ use helper::{clear_logs, ensure_helper, icon_path, lock_path, opsec_dir, sf_symb
 use mac_spoof::{mac_spoof_enable, mac_spoof_restore};
 use menu::{rebuild_menu, toggle_cfg};
 use proxy::{dns_leak_disable, dns_leak_enable, env_inject_disable, env_inject_enable,
+            hostname_anonymize, hostname_restore,
             ipv6_disable, ipv6_restore, proxy_disable, proxy_enable};
-use tor::{fetch_real_ip, fetch_tor_ip, new_tor_identity, start_tor, stop_tor, tor_ready};
+use tor::{fetch_tor_ip, local_real_ip, new_tor_identity, start_tor, stop_tor, tor_ready};
 
 async fn do_enable(shared: &Shared) {
     let cfg = shared.lock().unwrap().1.clone();
 
     if cfg.clear_logs { clear_logs(); }
+    // IPv6 disabled before MAC spoof: ifconfig down/up triggers NDP Router
+    // Solicitations that may expose the fe80:: link-local (EUI-64 derived) before
+    // the interface comes back up. Disabling IPv6 first prevents those packets.
+    ipv6_disable();
     if cfg.mac_spoof  { mac_spoof_enable(); }
 
     start_tor(&cfg);
@@ -36,7 +41,7 @@ async fn do_enable(shared: &Shared) {
     }
 
     proxy_enable();
-    ipv6_disable();
+    hostname_anonymize();
     if cfg.dns_leak    { dns_leak_enable(); }
     if cfg.pf_firewall { pf_enable(); }
     if cfg.env_inject  { env_inject_enable(); }
@@ -52,12 +57,10 @@ async fn do_enable(shared: &Shared) {
     }
 
     let tor_ip  = fetch_tor_ip().await;
-    let real_ip = fetch_real_ip().await;
 
     let mut lock = shared.lock().unwrap();
     lock.0.active  = true;
     lock.0.tor_ip  = tor_ip;
-    lock.0.real_ip = real_ip;
 }
 
 async fn do_disable(shared: &Shared) {
@@ -67,6 +70,7 @@ async fn do_disable(shared: &Shared) {
     if cfg.dns_leak    { dns_leak_disable(); }
     if cfg.env_inject  { env_inject_disable(); }
     proxy_disable();
+    hostname_restore();
     ipv6_restore();
     if cfg.firefox { firefox_apply(false, &cfg); }
     stop_tor();
@@ -74,12 +78,10 @@ async fn do_disable(shared: &Shared) {
 
     std::fs::remove_file(lock_path()).ok();
 
-    let real_ip = fetch_real_ip().await;
-
     let mut lock = shared.lock().unwrap();
     lock.0.active  = false;
     lock.0.tor_ip  = None;
-    lock.0.real_ip = real_ip;
+    lock.0.real_ip = local_real_ip();
 }
 
 fn emergency_teardown(cfg: &Config) {
@@ -87,6 +89,7 @@ fn emergency_teardown(cfg: &Config) {
     if cfg.dns_leak    { dns_leak_disable(); }
     if cfg.env_inject  { env_inject_disable(); }
     proxy_disable();
+    hostname_restore();
     ipv6_restore();
     if cfg.firefox     { firefox_apply(false, cfg); }
     stop_tor();
@@ -234,16 +237,15 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            let shared2 = shared.clone();
-            let app2    = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                let ip = fetch_real_ip().await;
-                let mut lock = shared2.lock().unwrap();
+            // Show local IP at startup without any outbound request (no real IP leak).
+            {
+                let ip = local_real_ip();
+                let mut lock = shared.lock().unwrap();
                 lock.0.real_ip = ip;
                 let (state, cfg) = lock.clone();
                 drop(lock);
-                rebuild_menu(&app2, &state, &cfg);
-            });
+                rebuild_menu(&app_handle, &state, &cfg);
+            }
 
             let shared3 = shared.clone();
             let app3    = app_handle.clone();
