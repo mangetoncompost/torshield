@@ -1,6 +1,6 @@
 [package]
 name = "torshield"
-version = "0.5.1"
+version = "0.6.0"
 description = "TorShield — menubar OPSEC app"
 authors = ["Silo"]
 edition = "2021"
@@ -20,3 +20,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["socks"] }
+getrandom = "0.3"
+tempfile = "3"
+hmac = "0.13"
+sha2 = "0.11"
+security-framework = "3"

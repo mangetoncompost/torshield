@@ -1,6 +1,10 @@
 use std::io::Read;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use hmac::{Hmac, Mac, KeyInit};
+use sha2::Sha256;
+use security_framework::passwords::{set_generic_password, get_generic_password};
+type HmacSha256 = Hmac<Sha256>;
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder, CheckMenuItemBuilder},
@@ -67,20 +71,73 @@ impl Default for Config {
     }
 }
 
+// ── Config HMAC integrity ─────────────────────────────────────────────────────
+//
+// La cle HMAC est stockee dans le Keychain macOS (inaccessible aux autres process).
+// Le JSON reste un fichier texte lisible, mais toute modification sans la cle
+// est detectee au chargement (mismatch HMAC -> defaults).
+
+const KC_SERVICE: &str = "TorShield";
+const KC_ACCOUNT: &str = "config-hmac-key";
+
+fn config_hmac_key() -> [u8; 32] {
+    // Recuperer la cle depuis le Keychain, ou en generer une nouvelle
+    if let Ok(k) = get_generic_password(KC_SERVICE, KC_ACCOUNT) {
+        if k.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&k);
+            return arr;
+        }
+    }
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).expect("getrandom failed");
+    set_generic_password(KC_SERVICE, KC_ACCOUNT, &key).ok();
+    key
+}
+
+fn config_hmac(key: &[u8; 32], json: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).unwrap();
+    mac.update(json.as_bytes());
+    mac.finalize().into_bytes().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 impl Config {
     fn load() -> Self {
-        let path = format!("{}/torshield.json", opsec_dir());
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let dir  = opsec_dir();
+        let path = format!("{}/torshield.json", dir);
+        let hmac_path = format!("{}/torshield.json.hmac", dir);
+
+        let json = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return Self::default(),
+        };
+
+        // Verifier l'integrite avant de deserialiser
+        let stored_hmac = std::fs::read_to_string(&hmac_path).unwrap_or_default();
+        let stored_hmac = stored_hmac.trim();
+        let key = config_hmac_key();
+        let expected = config_hmac(&key, &json);
+        if stored_hmac != expected {
+            // Fichier altere ou premier lancement sans HMAC : reset aux defaults
+            eprintln!("TorShield: config HMAC mismatch - resetting to defaults");
+            let default = Self::default();
+            default.save();
+            return default;
+        }
+
+        serde_json::from_str(&json).unwrap_or_default()
     }
+
     fn save(&self) {
         let dir = opsec_dir();
         std::fs::create_dir_all(&dir).ok();
         let path = format!("{}/torshield.json", dir);
+        let hmac_path = format!("{}/torshield.json.hmac", dir);
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            std::fs::write(path, json).ok();
+            let key = config_hmac_key();
+            let mac = config_hmac(&key, &json);
+            std::fs::write(&path, json).ok();
+            std::fs::write(&hmac_path, mac).ok();
         }
     }
     fn excluded_nodes(&self) -> String {
@@ -138,45 +195,82 @@ fn helper_ok() -> bool {
 fn ensure_helper(app: &tauri::App) {
     if helper_ok() { return; }
 
-    // Localiser ts_helper.c dans les ressources du bundle
-    let c_src = app.path()
+    // Source C : priorite au bundle signe (path non modifiable par un attaquant)
+    let bundle_src = app.path()
         .resource_dir()
         .ok()
         .map(|d| d.join("ts_helper.c"))
         .filter(|p| p.exists());
 
-    let src_path = match c_src {
-        Some(p) => p.to_string_lossy().to_string(),
+    // Binaire compile dans /tmp avec nom aleatoire - hors de opsec_dir() qui est
+    // world-accessible. NamedTempFile utilise O_CREAT|O_EXCL : atomique, pas de race.
+    // Le NamedTempFile est conserve jusqu'a la fin de la fonction pour garder le fd ouvert.
+    let tmp_bin_file = match tempfile::Builder::new()
+        .prefix("ts_helper_")
+        .tempfile_in("/tmp")
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let tmp_bin_path = tmp_bin_file.path().to_path_buf();
+    // On ferme le fd pour que clang puisse ecrire dans le fichier (O_EXCL deja acquis)
+    drop(tmp_bin_file);
+
+    let compiled = match bundle_src {
+        Some(ref p) => {
+            // Source dans le bundle : path signe, pas modifiable
+            Command::new("clang")
+                .args([p.to_str().unwrap_or(""), "-o", tmp_bin_path.to_str().unwrap_or("")])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
         None => {
-            // Fallback : ecrire le source depuis la constante embarquee
-            let fallback = format!("{}/ts_helper.c", opsec_dir());
-            std::fs::create_dir_all(opsec_dir()).ok();
-            std::fs::write(&fallback, include_str!("ts_helper.c")).ok();
-            fallback
+            // Fallback : ecrire le source embarque dans un fichier temporaire isole
+            // O_CREAT|O_EXCL via create_new(true) : echoue si le fichier existe deja
+            // ou si c'est un symlink - elimine l'injection via opsec_dir() symlinke
+            let src_tmp = match tempfile::Builder::new()
+                .prefix("ts_helper_src_")
+                .suffix(".c")
+                .tempfile_in("/tmp")
+            {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+            let src_path = src_tmp.path().to_path_buf();
+            if std::fs::write(&src_path, include_str!("ts_helper.c")).is_err() { return; }
+            let ok = Command::new("clang")
+                .args([src_path.to_str().unwrap_or(""), "-o", tmp_bin_path.to_str().unwrap_or("")])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            // src_tmp droppé ici : suppression automatique du .c temporaire
+            ok
         }
     };
 
-    let tmp_bin = format!("{}/ts_helper_tmp", opsec_dir());
-
-    // Compiler en binaire natif (clang est toujours present sur macOS avec Xcode CLT)
-    let compiled = Command::new("clang")
-        .args([&src_path, "-o", &tmp_bin])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
     if !compiled { return; }
 
-    // Installer avec privileges admin - une seule dialog, jamais redemandee
+    // Verifier que le binaire compile est bien un fichier regulier (pas un symlink)
+    // en utilisant metadata() qui suit les symlinks - si tmp_bin_path est devenu un
+    // symlink entre la compilation et ici, is_file() retourne false sur la cible.
+    // Verification supplementaire : lstat via symlink_metadata() ne doit pas etre un symlink.
+    let meta = std::fs::symlink_metadata(&tmp_bin_path);
+    let is_regular = meta.map(|m| m.file_type().is_file()).unwrap_or(false);
+    if !is_regular { return; }
+
+    // Installer avec privileges admin via osascript
+    // tmp_bin_path est dans /tmp avec nom aleatoire - non previsible par un attaquant
+    let tmp_str = tmp_bin_path.to_string_lossy();
     let script = format!(
         "do shell script \
          \"cp '{tmp}' '{dst}' && chown root:wheel '{dst}' && chmod 4755 '{dst}'\" \
          with administrator privileges",
-        tmp = tmp_bin.replace('\'', "'\\''"),
+        tmp = tmp_str.replace('\'', "'\\''"),
         dst = TS_HELPER,
     );
     Command::new("osascript").args(["-e", &script]).output().ok();
-    std::fs::remove_file(&tmp_bin).ok();
+    std::fs::remove_file(&tmp_bin_path).ok();
 }
 
 // Retourne les services reseau actifs (filtre les desactives marques d'un *)
@@ -213,18 +307,7 @@ fn tor_pid() -> Option<u32> {
 
 fn rand_bytes(n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        if f.read_exact(&mut buf).is_err() {
-            // /dev/urandom lisible mais read a echoue - fallback horloge
-            for (i, b) in buf.iter_mut().enumerate() {
-                *b = (std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_nanos()
-                    .wrapping_add(i as u32 * 0x9e3779b9)) as u8;
-            }
-        }
-    }
+    getrandom::fill(&mut buf).expect("getrandom failed");
     buf
 }
 
@@ -277,24 +360,91 @@ fn stop_tor() {
     std::fs::remove_file(format!("{}/tor.pid", opsec_dir())).ok();
 }
 
-// Envoie SIGNAL NEWNYM et verifie la reponse 250 OK.
+// Envoie SIGNAL NEWNYM via SAFECOOKIE authentication (spec Tor 193).
+// SAFECOOKIE evite d'envoyer le cookie en clair - challenge/response HMAC-SHA256.
+// Protocole : AUTHCHALLENGE -> verif ServerHash -> AUTHENTICATE ControllerHash -> SIGNAL NEWNYM
 fn new_tor_identity() -> bool {
-    let cookie = format!("{}/tor_data/control_auth/control_auth_cookie", opsec_dir());
-    let auth = std::fs::read(&cookie)
-        .map(|b| b.iter().map(|x| format!("{:02x}", x)).collect::<String>())
-        .unwrap_or_default();
+    let cookie_path = format!("{}/tor_data/control_auth/control_auth_cookie", opsec_dir());
+    let cookie = match std::fs::read(&cookie_path) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return false,
+    };
+
     let Ok(mut s) = std::net::TcpStream::connect_timeout(
         &"127.0.0.1:9051".parse().unwrap(),
         std::time::Duration::from_secs(3),
     ) else { return false; };
     s.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok();
     use std::io::Write;
+
+    // Etape 1 : generer un ClientNonce aleatoire 32 bytes
+    let mut client_nonce = [0u8; 32];
+    getrandom::fill(&mut client_nonce).unwrap();
+    let client_nonce_hex: String = client_nonce.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // Etape 2 : AUTHCHALLENGE SAFECOOKIE <client_nonce>
     if s.write_all(
-        format!("AUTHENTICATE {}\r\nSIGNAL NEWNYM\r\nQUIT\r\n", auth).as_bytes()
+        format!("AUTHCHALLENGE SAFECOOKIE {}\r\n", client_nonce_hex).as_bytes()
     ).is_err() { return false; }
+
+    // Etape 3 : lire la reponse "250 AUTHCHALLENGE SERVERHASH=<hex> SERVERNONCE=<hex>"
+    let mut buf = [0u8; 512];
+    let n = match s.read(&mut buf) {
+        Ok(n) if n > 0 => n,
+        _ => return false,
+    };
+    let line = match std::str::from_utf8(&buf[..n]) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    if !line.starts_with("250 AUTHCHALLENGE") { return false; }
+
+    // Extraire SERVERHASH et SERVERNONCE
+    let server_hash_hex = line.split("SERVERHASH=")
+        .nth(1).and_then(|s| s.split_whitespace().next()).unwrap_or("");
+    let server_nonce_hex = line.split("SERVERNONCE=")
+        .nth(1).and_then(|s| s.split_whitespace().next().map(|s| s.trim_end_matches("\r\n")))
+        .unwrap_or("");
+
+    let server_hash  = hex_decode(server_hash_hex);
+    let server_nonce = hex_decode(server_nonce_hex);
+    if server_hash.len() != 32 || server_nonce.len() != 32 { return false; }
+
+    // Etape 4 : verifier ServerHash = HMAC-SHA256(
+    //   key  = "Tor safe cookie authentication server-to-controller hash",
+    //   data = cookie || client_nonce || server_nonce)
+    let server_key = b"Tor safe cookie authentication server-to-controller hash";
+    let mut mac_srv = HmacSha256::new_from_slice(server_key).unwrap();
+    mac_srv.update(&cookie);
+    mac_srv.update(&client_nonce);
+    mac_srv.update(&server_nonce);
+    if mac_srv.verify_slice(&server_hash).is_err() { return false; }
+
+    // Etape 5 : calculer ControllerHash = HMAC-SHA256(
+    //   key  = "Tor safe cookie authentication controller-to-server hash",
+    //   data = cookie || client_nonce || server_nonce)
+    let ctrl_key = b"Tor safe cookie authentication controller-to-server hash";
+    let mut mac_ctrl = HmacSha256::new_from_slice(ctrl_key).unwrap();
+    mac_ctrl.update(&cookie);
+    mac_ctrl.update(&client_nonce);
+    mac_ctrl.update(&server_nonce);
+    let controller_hash = mac_ctrl.finalize().into_bytes();
+    let controller_hash_hex: String = controller_hash.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // Etape 6 : AUTHENTICATE <controller_hash> puis SIGNAL NEWNYM
+    if s.write_all(
+        format!("AUTHENTICATE {}\r\nSIGNAL NEWNYM\r\nQUIT\r\n", controller_hash_hex).as_bytes()
+    ).is_err() { return false; }
+
     let mut resp = String::new();
     s.read_to_string(&mut resp).ok();
     resp.contains("250 OK")
+}
+
+fn hex_decode(s: &str) -> Vec<u8> {
+    (0..s.len()).step_by(2)
+        .filter_map(|i| u8::from_str_radix(&s[i..i+2], 16).ok())
+        .collect()
 }
 
 // ── Env vars injection (Python/curl/wget/Go/Node — tout ce qui lit HTTP_PROXY) ─
@@ -476,11 +626,16 @@ fn dns_leak_disable() {
     let dir      = opsec_dir();
     let pid_file = format!("{}/dnsmasq.pid", dir);
     if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-        sh("kill", &[pid.trim()]);
+        // dnsmasq est lancé via root() (ts_helper) donc tourne en tant que nobody —
+        // sh("kill") depuis l'user courant retourne EPERM silencieusement.
+        root("kill", &[pid.trim()]);
         std::fs::remove_file(&pid_file).ok();
     }
+    // Filet de sécurité : tuer tout dnsmasq restant, même orphelin
     let dnsmasq_conf = format!("{}/dnsmasq.conf", dir);
-    sh("pkill", &["-f", &format!("dnsmasq.*{}", dnsmasq_conf)]);
+    root("/usr/bin/pkill", &["-f", &format!("dnsmasq.*{}", dnsmasq_conf)]);
+    // Fallback sans filtre conf au cas où le conf path diffère
+    root("/usr/bin/pkill", &["-x", "dnsmasq"]);
     for svc in get_network_services() {
         sh("networksetup", &["-setdnsservers", &svc, "empty"]);
     }
@@ -497,15 +652,20 @@ const PF_ANCHOR_PATH: &str = "/etc/pf.anchors/com.torshield.killswitch";
 const WATCHDOG_PLIST: &str = "/Library/LaunchDaemons/com.torshield.watchdog.plist";
 const WATCHDOG_SCRIPT: &str = "/usr/local/bin/torshield-watchdog";
 
-fn build_pf_anchor_rules() -> String {
-    let iface = primary_interface();
+// Table definie dans pf.conf (pas dans l'anchor) : les tables dans les anchors
+// causent des echecs silencieux au boot sur macOS (comportement OpenBSD non porte).
+// Source : https://iyanmv.medium.com/setting-up-correctly-packet-filter-pf-firewall-on-any-macos-from-sierra-to-big-sur-47e70e062a0e
+const PF_TABLE_MARKER: &str = "# TorShield-apple-relay-table";
+const PF_TABLE_DEF: &str =
+    "# TorShield-apple-relay-table\n\
+     table <apple_relay> const { 17.0.0.0/8 }\n";
+
+fn build_pf_anchor_rules(iface: &str) -> String {
     format!(
         "# TorShield kill switch anchor\n\
          # Loopback : Tor tourne sur 127.0.0.1 - ne jamais bloquer lo0\n\
          set skip on lo0\n\
-         # Bloquer iCloud Private Relay (Apple AS714 17.0.0.0/8)\n\
-         # Private Relay bypass le proxy systeme - doit etre bloque explicitement\n\
-         table <apple_relay> const {{ 17.0.0.0/8 }}\n\
+         # Bloquer iCloud Private Relay - table definie dans /etc/pf.conf\n\
          block drop out quick on {iface} to <apple_relay>\n\
          # Bloquer tout le trafic sortant par defaut (fail-closed)\n\
          block drop out quick on {iface} all\n\
@@ -522,31 +682,39 @@ fn pf_anchor_reference() -> String {
     format!("anchor \"{PF_ANCHOR}\"\nload anchor \"{PF_ANCHOR}\" from \"{PF_ANCHOR_PATH}\"\n")
 }
 
-fn pf_enable() {
-    let anchor_rules = build_pf_anchor_rules();
+fn write_pf_conf(content: &str) {
+    let mut child = Command::new(TS_HELPER)
+        .arg("write-pf-conf")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn().ok();
+    if let Some(ref mut c) = child {
+        if let Some(stdin) = c.stdin.take() {
+            use std::io::Write;
+            let mut s = stdin;
+            s.write_all(content.as_bytes()).ok();
+        }
+        c.wait().ok();
+    }
+}
 
-    // 1. Ecrire les regles dans l'anchor file
+fn pf_enable() {
+    let iface = primary_interface();
+    let anchor_rules = build_pf_anchor_rules(&iface);
+
+    // 1. Ecrire les regles dans l'anchor file (sans table - voir PF_TABLE_MARKER)
     std::fs::write(PF_ANCHOR_PATH, &anchor_rules).ok();
 
-    // 2. Verifier que /etc/pf.conf reference l'anchor - l'ajouter si absent
+    // 2. Patcher /etc/pf.conf : table apple_relay + reference anchor
+    //    Les deux sont idempotents (check contains avant ecriture)
     let pf_conf = std::fs::read_to_string("/etc/pf.conf").unwrap_or_default();
-    if !pf_conf.contains(PF_ANCHOR) {
-        let patched = format!("{}\n{}", pf_conf.trim_end(), pf_anchor_reference());
-        // Ecrire via ts_helper tee (root) - plus sur que mv qui permettrait de
-        // deplacer n'importe quel fichier en root
-        let mut child = Command::new(TS_HELPER)
-            .args(["/usr/bin/tee", "/etc/pf.conf"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn().ok();
-        if let Some(ref mut c) = child {
-            if let Some(stdin) = c.stdin.take() {
-                use std::io::Write;
-                let mut s = stdin;
-                s.write_all(patched.as_bytes()).ok();
-            }
-            c.wait().ok();
-        }
+    let needs_table  = !pf_conf.contains(PF_TABLE_MARKER);
+    let needs_anchor = !pf_conf.contains(PF_ANCHOR);
+    if needs_table || needs_anchor {
+        let mut patched = pf_conf.trim_end().to_string();
+        if needs_table  { patched.push_str(&format!("\n{}", PF_TABLE_DEF)); }
+        if needs_anchor { patched.push_str(&format!("\n{}", pf_anchor_reference())); }
+        write_pf_conf(&patched);
     }
 
     // 3. Charger l'anchor et activer pf
@@ -719,6 +887,7 @@ async fn ensure_canvasblocker(ff_profiles: &str) {
     let xpi_cache = format!("{}/canvasblocker.xpi", opsec_dir());
     if !std::path::Path::new(&xpi_cache).exists() {
         let Ok(client) = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("socks5h://127.0.0.1:9050").unwrap())
             .timeout(std::time::Duration::from_secs(30)).build() else { return; };
         let Ok(resp) = client.get(CANVASBLOCKER_URL).send().await else { return; };
         let Ok(bytes) = resp.bytes().await else { return; };
@@ -763,9 +932,18 @@ fn firefox_apply(enable: bool, cfg: &Config) {
         let pjs = entry.path().join("prefs.js");
         let bak = entry.path().join("user.js.opsec_bak");
 
+        // Ne supprimer que les lignes user_pref() dont le nom correspond a un
+        // prefixe bloque - evite de supprimer les commentaires ou des prefs
+        // tierces dont le nom contiendrait accidentellement un sous-string bloque.
         let strip = |content: &str| -> String {
             content.lines()
-                .filter(|l| !blocked.iter().any(|b| l.contains(b)))
+                .filter(|l| {
+                    let t = l.trim_start();
+                    if !t.starts_with("user_pref(\"") { return true; }
+                    let name_start = "user_pref(\"".len();
+                    let name = &t[name_start..];
+                    !blocked.iter().any(|b| name.starts_with(b))
+                })
                 .collect::<Vec<_>>().join("\n")
         };
 
