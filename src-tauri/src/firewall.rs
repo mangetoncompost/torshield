@@ -24,7 +24,18 @@ const CAPTIVE_HOSTS: &[&str] = &[
     "apple.com",
 ];
 
+fn sanitize_iface(iface: &str) -> &str {
+    // pf interface names are alphanumeric on macOS (en0, utun2, etc.).
+    // Reject anything else to prevent rule injection if route output is tampered.
+    if iface.chars().all(|c| c.is_ascii_alphanumeric()) && !iface.is_empty() {
+        iface
+    } else {
+        "en0"
+    }
+}
+
 fn build_pf_anchor_rules(iface: &str) -> String {
+    let iface = sanitize_iface(iface);
     // pf evaluates rules top-to-bottom; "quick" stops evaluation immediately.
     // Passes must come BEFORE the default block, or they are never reached.
     // "pass in" is removed: stateful tracking on "pass out ... keep state"
@@ -177,8 +188,12 @@ pub fn ensure_watchdog() {
         script = WATCHDOG_SCRIPT
     );
 
-    let already_installed = std::path::Path::new(WATCHDOG_PLIST).exists()
-        && std::path::Path::new(WATCHDOG_SCRIPT).exists();
+    // Verify content match, not just file existence - a corrupted or replaced
+    // watchdog script runs as root permanently via LaunchDaemon (HIGH-4).
+    let already_installed = std::fs::read_to_string(WATCHDOG_SCRIPT)
+        .map(|s| s == script)
+        .unwrap_or(false)
+        && std::path::Path::new(WATCHDOG_PLIST).exists();
     if already_installed { return; }
 
     let install_cmd = format!(

@@ -1,6 +1,6 @@
 use std::process::Command;
 
-use crate::helper::{opsec_dir, sh, root, get_network_services};
+use crate::helper::{opsec_dir, ensure_opsec_dir, sh, root, get_network_services};
 
 const ENV_MARKER_BEGIN: &str = "# TorShield-env-begin";
 const ENV_MARKER_END:   &str = "# TorShield-env-end";
@@ -21,7 +21,7 @@ pub fn env_inject_enable() {
          export NO_PROXY=localhost,127.0.0.1,::1,github.com,api.github.com,*.github.com,*.anthropic.com,*.claude.ai\n\
          export no_proxy=localhost,127.0.0.1,::1,github.com,api.github.com,*.github.com,*.anthropic.com,*.claude.ai\n"
     );
-    std::fs::create_dir_all(opsec_dir()).ok();
+    ensure_opsec_dir();
     std::fs::write(env_file_path(), &content).ok();
 
     let hook = format!(
@@ -127,15 +127,31 @@ pub fn hostname_restore() {
     }
 }
 
-pub fn dns_leak_enable() {
-    let dir          = opsec_dir();
-    let pid_file     = format!("{}/dnsmasq.pid", dir);
-    let dnsmasq_conf = format!("{}/dnsmasq.conf", dir);
+const DNSMASQ_CONF_ROOT: &str = "/etc/dnsmasq-torshield.conf";
 
-    std::fs::write(&dnsmasq_conf, format!(
+pub fn dns_leak_enable() {
+    let pid_file = format!("{}/dnsmasq.pid", opsec_dir());
+
+    // Config written to root-owned /etc/dnsmasq-torshield.conf via ts_helper -
+    // prevents local privilege escalation via dhcp-script/conf-file injection
+    // in a user-writable config read by a root dnsmasq process (CRIT-1).
+    // Only allowlisted options are used.
+    let conf = format!(
         "no-resolv\nserver=127.0.0.1#9053\nlisten-address=127.0.0.1\nport=53\n\
          pid-file={pid_file}\n"
-    )).ok();
+    );
+    let mut child = Command::new(crate::helper::TS_HELPER)
+        .arg("write-dnsmasq-conf")
+        .stdin(std::process::Stdio::piped())
+        .spawn().ok();
+    if let Some(ref mut c) = child {
+        if let Some(stdin) = c.stdin.take() {
+            use std::io::Write;
+            let mut s = stdin;
+            s.write_all(conf.as_bytes()).ok();
+        }
+        c.wait().ok();
+    }
 
     let dnsmasq_bin = [
         "/opt/homebrew/sbin/dnsmasq",
@@ -146,7 +162,7 @@ pub fn dns_leak_enable() {
 
     let Some(bin) = dnsmasq_bin else { return; };
 
-    root(&bin, &["-C", &dnsmasq_conf]);
+    root(&bin, &["-C", DNSMASQ_CONF_ROOT]);
 
     for svc in get_network_services() {
         sh("networksetup", &["-setdnsservers", &svc, "127.0.0.1"]);
@@ -154,15 +170,19 @@ pub fn dns_leak_enable() {
 }
 
 pub fn dns_leak_disable() {
-    let dir      = opsec_dir();
-    let pid_file = format!("{}/dnsmasq.pid", dir);
-    if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-        root("kill", &[pid.trim()]);
+    let pid_file = format!("{}/dnsmasq.pid", opsec_dir());
+    // Kill via PID from pid-file with absolute path - avoids pkill -f pattern
+    // matching against arbitrary process cmdlines (HIGH-1).
+    if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+        let pid = pid_str.trim();
+        if pid.chars().all(|c| c.is_ascii_digit()) && !pid.is_empty() {
+            root("/bin/kill", &[pid]);
+        }
         std::fs::remove_file(&pid_file).ok();
     }
-    let dnsmasq_conf = format!("{}/dnsmasq.conf", dir);
-    root("/usr/bin/pkill", &["-f", &format!("dnsmasq.*{}", dnsmasq_conf)]);
+    // Fallback: pkill by exact name only, no -f pattern
     root("/usr/bin/pkill", &["-x", "dnsmasq"]);
+    Command::new(crate::helper::TS_HELPER).arg("rm-dnsmasq-conf").output().ok();
     for svc in get_network_services() {
         sh("networksetup", &["-setdnsservers", &svc, "empty"]);
     }

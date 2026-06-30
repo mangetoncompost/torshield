@@ -1,5 +1,80 @@
 # Changelog
 
+## v0.8.0 - 2026-07-01
+
+Third security audit. All findings confirmed with reference sources before implementation.
+
+### Security - Critical
+
+- **dnsmasq config moved to root-owned path** : `dns_leak_enable()` was writing
+  `dnsmasq.conf` into `~/.config/opsec/` (user-writable), then calling ts_helper to run
+  dnsmasq as root with `-C <user-file>`. A local attacker or compromised process could
+  inject arbitrary dnsmasq directives (`dhcp-script`, `conf-file`, `addn-hosts`) into
+  that file before dnsmasq started - gaining code execution as root on the next connect.
+  Fixed: new `write-dnsmasq-conf` and `rm-dnsmasq-conf` verbs in ts_helper; config is
+  written to `/etc/dnsmasq-torshield.conf` (root:wheel, O_NOFOLLOW, hardcoded path).
+
+- **gen_icon recompiled every call, never reused** : `sf_symbol_png()` compiled the icon
+  generator once and cached the binary in `~/.config/opsec/gen_icon`. Subsequent calls
+  reused the cached binary without integrity verification - a binary planting attack. Fixed:
+  the binary is always deleted and recompiled from the embedded source (`include_str!`) on
+  every invocation. lib.rs already removes gen_icon at startup; this closes the within-session
+  window.
+
+### Security - High
+
+- **TOCTOU in ensure_helper() closed** : the compiled ts_helper binary was written into a
+  `NamedTempFile` that was `drop()`-d before clang ran. The drop releases both the file
+  descriptor and the path reservation; clang then recreated the file without O_EXCL, opening
+  a race between the free and the write. Fixed: compile inside a `tempdir()` (mode 0700,
+  single owner) that is kept alive until the osascript `cp` completes.
+
+- **dnsmasq kill via PID, not pkill -f** : `dns_leak_disable()` was calling
+  `pkill -f dnsmasq.*<user-controlled-path>`. With root privileges, `pkill -f` pattern-
+  matches against all process cmdlines; a crafted path could send SIGTERM to unrelated root
+  processes. Also, `root("kill", ...)` used the bare name `"kill"` which does not match
+  `/bin/kill` in the ts_helper whitelist and was silently ignored. Fixed: read PID from
+  `dnsmasq.pid`, validate digits-only, kill via `/bin/kill <pid>`.
+
+- **Watchdog integrity check** : `ensure_watchdog()` only checked for file existence
+  (`Path::exists()`). A replaced or corrupted watchdog script running as a root
+  LaunchDaemon is a persistent root shell. Fixed: `fs::read_to_string(WATCHDOG_SCRIPT)`
+  and compare against the expected content before skipping reinstallation.
+
+### Security - Medium
+
+- **opsec_dir permissions restricted to 0700** : `~/.config/opsec/` was created with the
+  process umask default (0755 on macOS), making the torrc, HMAC key, SAFECOOKIE, and
+  hostname backups world-readable on multi-user machines. Fixed: `ensure_opsec_dir()` calls
+  `set_permissions(0o700)` after `create_dir_all`. All call sites updated.
+
+- **HOME fallback uses passwd database** : if `HOME` is unset (early-boot LaunchAgent with
+  reduced environment), `opsec_dir()` fell back to `/tmp/.config/opsec/` (world-listable).
+  Fixed: resolve the home directory from `getpwuid(getuid())` before falling back.
+
+- **Tor binary resolved via absolute path** : `Command::new("tor")` relied on PATH for a
+  security-critical process. A malicious binary earlier in PATH could open a listener on
+  9050, pass `tor_ready()`, and silently intercept all traffic. Fixed: `tor_bin()` probes
+  known Homebrew paths first (`/opt/homebrew/bin/tor`, `/usr/local/bin/tor`) and only
+  falls back to `which` with an absolute-path validation.
+
+### Security - Low
+
+- **pf interface name validated** : `primary_interface()` output was injected verbatim
+  into pf rules. Interface names on macOS are alphanumeric (`en0`, `utun2`); an unexpected
+  value could corrupt the rules. Fixed: `sanitize_iface()` rejects any non-alphanumeric
+  name and defaults to `en0`.
+
+### UI
+
+- Menu fully in English with professional labels (Mullvad/Little Snitch style):
+  `Connect` / `Disconnect`, `New Identity`, `Identity Rotation`, `Kill Switch`,
+  `MAC Address Randomization`, `DNS Leak Protection`, `Fingerprint Resistance`,
+  `Advanced` (was `Dev / Scripts`), `[OK]` / `[!]` dependency indicators.
+
+---
+
+
 ## v0.6.0 - 2026-07-01
 
 Full security audit. All changes are backed by reference sources (MITRE CWE,

@@ -85,6 +85,38 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // Verbe interne write-dnsmasq-conf : ecrit /etc/dnsmasq-torshield.conf depuis stdin
+    // Le fichier appartient a root:wheel - empeche toute injection d'options arbitraires
+    // (dhcp-script, conf-file, addn-hosts) dans un process root.
+    if (strcmp(argv[1], "write-dnsmasq-conf") == 0) {
+        if (argc != 2) {
+            fprintf(stderr, "ts_helper: write-dnsmasq-conf n'accepte pas d'arguments\n");
+            return 1;
+        }
+        if (setuid(0) != 0 || setgid(0) != 0) {
+            fprintf(stderr, "ts_helper: elevation root echouee\n");
+            return 1;
+        }
+        return write_root_file("/etc/dnsmasq-torshield.conf", 0644);
+    }
+
+    // Verbe interne rm-dnsmasq-conf : supprime /etc/dnsmasq-torshield.conf
+    if (strcmp(argv[1], "rm-dnsmasq-conf") == 0) {
+        if (argc != 2) {
+            fprintf(stderr, "ts_helper: rm-dnsmasq-conf n'accepte pas d'arguments\n");
+            return 1;
+        }
+        if (setuid(0) != 0 || setgid(0) != 0) {
+            fprintf(stderr, "ts_helper: elevation root echouee\n");
+            return 1;
+        }
+        if (unlink("/etc/dnsmasq-torshield.conf") != 0 && errno != ENOENT) {
+            perror("ts_helper: unlink");
+            return 1;
+        }
+        return 0;
+    }
+
     int allowed = 0;
     for (int i = 0; ALLOWED[i] != NULL; i++) {
         if (strcmp(argv[1], ALLOWED[i]) == 0) { allowed = 1; break; }

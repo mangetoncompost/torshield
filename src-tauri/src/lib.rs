@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use config::{Config, OpsecState, Shared};
 use firewall::{pf_disable, pf_enable, ensure_watchdog};
 use firefox::{ensure_canvasblocker, firefox_apply};
-use helper::{clear_logs, ensure_helper, icon_path, lock_path, opsec_dir, sf_symbol_png};
+use helper::{clear_logs, ensure_helper, ensure_opsec_dir, icon_path, lock_path, opsec_dir, sf_symbol_png};
 use mac_spoof::{mac_spoof_enable, mac_spoof_restore};
 use menu::{rebuild_menu, toggle_cfg};
 use proxy::{dns_leak_disable, dns_leak_enable, env_inject_disable, env_inject_enable,
@@ -46,7 +46,7 @@ async fn do_enable(shared: &Shared) {
     if cfg.pf_firewall { pf_enable(); }
     if cfg.env_inject  { env_inject_enable(); }
 
-    std::fs::create_dir_all(opsec_dir()).ok();
+    ensure_opsec_dir();
     std::fs::write(lock_path(), "").ok();
 
     if cfg.firefox {
@@ -120,7 +120,7 @@ pub fn run() {
             ensure_watchdog();
             pf_disable();
 
-            std::fs::create_dir_all(opsec_dir()).ok();
+            ensure_opsec_dir();
             let _ = std::fs::remove_file(format!("{}/gen_icon", opsec_dir()));
             sf_symbol_png("shield",           18, &icon_path(false));
             sf_symbol_png("lock.shield.fill", 18, &icon_path(true));

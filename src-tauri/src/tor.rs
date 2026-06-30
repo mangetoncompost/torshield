@@ -20,6 +20,17 @@ pub fn tor_pid() -> Option<u32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+fn tor_bin() -> Option<String> {
+    // Resolve to an absolute path - never rely on PATH for a security-critical binary.
+    for candidate in ["/opt/homebrew/bin/tor", "/usr/local/bin/tor", "/usr/bin/tor"] {
+        if std::path::Path::new(candidate).exists() { return Some(candidate.into()); }
+    }
+    // Last resort: ask which(1) but validate the result is an absolute path
+    let out = std::process::Command::new("which").arg("tor").output().ok()?;
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if s.starts_with('/') && std::path::Path::new(&s).exists() { Some(s) } else { None }
+}
+
 pub fn start_tor(cfg: &Config) -> bool {
     let dir    = opsec_dir();
     let data   = format!("{}/tor_data", dir);
@@ -41,7 +52,8 @@ pub fn start_tor(cfg: &Config) -> bool {
     // exclusions, CookieAuthFile path, or injection of HiddenServiceDir.
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o600)).ok();
-    Command::new("tor")
+    let Some(tor) = tor_bin() else { return false; };
+    Command::new(&tor)
         .args(["-f", &conf, "--PidFile", &pid, "--RunAsDaemon", "1"])
         .spawn().is_ok()
 }
