@@ -61,7 +61,8 @@ pub fn proxy_enable() {
     for svc in get_network_services() {
         sh("networksetup", &["-setsocksfirewallproxy", &svc, "127.0.0.1", "9050", "off"]);
         sh("networksetup", &["-setsocksfirewallproxystate", &svc, "on"]);
-        sh("networksetup", &["-setproxybypassdomains", &svc, "localhost, 127.0.0.1"]);
+        sh("networksetup", &["-setproxybypassdomains", &svc,
+            "localhost", "127.0.0.1", "*.anthropic.com", "*.claude.ai", "api.github.com", "*.github.com"]);
     }
 }
 
