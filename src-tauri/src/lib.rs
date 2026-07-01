@@ -16,10 +16,10 @@ use config::{Config, OpsecState, Shared};
 use firewall::{pf_disable, pf_enable, ensure_watchdog};
 use firefox::{ensure_canvasblocker, firefox_apply};
 use helper::{clear_logs, ensure_helper, ensure_opsec_dir, icon_path, lock_path, notify, opsec_dir, sf_symbol_png};
-use mac_spoof::{mac_spoof_enable, mac_spoof_restore};
+use mac_spoof::{mac_spoof_enable, mac_spoof_restore, mac_spoof_rotate};
 use menu::{rebuild_menu, toggle_cfg};
 use proxy::{dns_leak_disable, dns_leak_enable, env_inject_disable, env_inject_enable,
-            hostname_anonymize, hostname_restore,
+            hostname_anonymize, hostname_restore, hostname_rotate,
             ipv6_disable, ipv6_restore, proxy_disable, proxy_enable};
 use tor::{fetch_real_ip, fetch_tor_ip, local_real_ip, new_tor_identity, start_tor, stop_tor, tor_ready};
 
@@ -171,7 +171,10 @@ pub fn run() {
                         "rotate" => {
                             let shared2 = shared.clone();
                             tauri::async_runtime::spawn(async move {
+                                let cfg = shared2.lock().unwrap().1.clone();
                                 new_tor_identity();
+                                if cfg.mac_spoof  { mac_spoof_rotate(); }
+                                hostname_rotate();
                                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                                 let ip = fetch_tor_ip().await;
                                 if let Some(ref exit) = ip {
@@ -302,8 +305,14 @@ pub fn run() {
                     tokio::pin!(sleep);
                     tokio::select! {
                         _ = &mut sleep => {
-                            if shared3.lock().unwrap().0.active {
+                            let (is_active, cfg) = {
+                                let lock = shared3.lock().unwrap();
+                                (lock.0.active, lock.1.clone())
+                            };
+                            if is_active {
                                 new_tor_identity();
+                                if cfg.mac_spoof  { mac_spoof_rotate(); }
+                                hostname_rotate();
                                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                                 let ip = fetch_tor_ip().await;
                                 if let Some(ref exit) = ip {

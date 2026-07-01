@@ -18,19 +18,29 @@ fn ifconfig_ether_root(iface: &str, mac: &str) {
     root("/sbin/ifconfig", &[iface, "up"]);
 }
 
-pub fn mac_spoof_enable() {
-    let iface = primary_interface();
-    const APPLE_OUIS: &[[u8; 3]] = &[
-        [0x3c, 0x06, 0x30], [0xa8, 0x66, 0x7f], [0x8c, 0x85, 0x90],
-        [0xf0, 0x18, 0x98], [0x00, 0x17, 0xf2], [0x28, 0xcf, 0xe9],
-        [0xac, 0xbc, 0x32], [0x60, 0x03, 0x08], [0xe8, 0x8d, 0x28],
-        [0x78, 0x4f, 0x43],
-    ];
+const APPLE_OUIS: &[[u8; 3]] = &[
+    [0x3c, 0x06, 0x30], [0xa8, 0x66, 0x7f], [0x8c, 0x85, 0x90],
+    [0xf0, 0x18, 0x98], [0x00, 0x17, 0xf2], [0x28, 0xcf, 0xe9],
+    [0xac, 0xbc, 0x32], [0x60, 0x03, 0x08], [0xe8, 0x8d, 0x28],
+    [0x78, 0x4f, 0x43],
+];
+
+fn random_apple_mac() -> String {
     let b = rand_bytes(4);
     let oui = APPLE_OUIS[(b[0] as usize) % APPLE_OUIS.len()];
-    let mac = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        oui[0], oui[1], oui[2], b[1], b[2], b[3]);
-    ifconfig_ether_root(&iface, &mac);
+    format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        oui[0], oui[1], oui[2], b[1], b[2], b[3])
+}
+
+pub fn mac_spoof_enable() {
+    let iface = primary_interface();
+    ifconfig_ether_root(&iface, &random_apple_mac());
+}
+
+// Re-randomize MAC without restore logic - safe to call on every identity rotation.
+pub fn mac_spoof_rotate() {
+    let iface = primary_interface();
+    ifconfig_ether_root(&iface, &random_apple_mac());
 }
 
 pub fn mac_spoof_restore() {

@@ -81,27 +81,40 @@ pub fn ipv6_restore() {
 
 pub fn hostname_anonymize() {
     let dir = opsec_dir();
-    // Save current names before overwriting
+    // Save originals only if no backup exists yet (first call at connect).
     for (key, file) in [
         ("LocalHostName",  "local_hostname.bak"),
         ("ComputerName",   "computer_name.bak"),
         ("HostName",       "hostname.bak"),
     ] {
-        let out = Command::new("scutil").args(["--get", key]).output().ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        if !out.is_empty() {
-            std::fs::write(format!("{dir}/{file}"), &out).ok();
+        let bak_path = format!("{dir}/{file}");
+        if !std::path::Path::new(&bak_path).exists() {
+            let out = Command::new("scutil").args(["--get", key]).output().ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if !out.is_empty() { std::fs::write(&bak_path, &out).ok(); }
         }
     }
-    // Replace with neutral names - mDNSResponder picks up changes immediately
-    let script = "do shell script \
-        \"scutil --set LocalHostName 'anonymous' && \
-          scutil --set ComputerName 'MacBook' && \
-          scutil --set HostName 'anonymous'\" \
-        with administrator privileges";
-    Command::new("osascript").args(["-e", script]).output().ok();
+    hostname_rotate();
+}
+
+// Rotate to a new random neutral hostname without touching the saved backups.
+// Safe to call repeatedly during a session (auto-rotate).
+pub fn hostname_rotate() {
+    let suffix = {
+        let b = crate::helper::rand_bytes(3);
+        format!("{:02x}{:02x}{:02x}", b[0], b[1], b[2])
+    };
+    let local  = format!("mac-{suffix}");
+    let script = format!(
+        "do shell script \
+         \"scutil --set LocalHostName '{local}' && \
+           scutil --set ComputerName 'MacBook' && \
+           scutil --set HostName '{local}'\" \
+         with administrator privileges"
+    );
+    Command::new("osascript").args(["-e", &script]).output().ok();
 }
 
 pub fn hostname_restore() {
