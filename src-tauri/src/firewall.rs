@@ -2,6 +2,10 @@ use std::process::Command;
 
 use crate::helper::{root, primary_interface, TS_HELPER};
 
+#[link(name = "c")]
+extern "C" { fn getuid() -> u32; }
+fn libc_getuid() -> u32 { unsafe { getuid() } }
+
 const PF_ANCHOR: &str = "com.torshield.killswitch";
 const PF_ANCHOR_PATH: &str = "/etc/pf.anchors/com.torshield.killswitch";
 const WATCHDOG_PLIST: &str = "/Library/LaunchDaemons/com.torshield.watchdog.plist";
@@ -161,15 +165,24 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 pub fn ensure_watchdog() {
+    // launchctl asuser <uid> runs osascript in the user's GUI session from root,
+    // which is the only way to show a notification from a LaunchDaemon.
+    let uid = libc_getuid();
+
     let script = format!(
         "#!/bin/sh\n\
          while true; do\n\
            if ! pgrep -x torshield > /dev/null 2>&1; then\n\
              /sbin/pfctl -a '{anchor}' -F all 2>/dev/null\n\
+             /bin/launchctl asuser {uid} /usr/bin/osascript -e \
+               'display notification \"Kill switch disabled - reopen TorShield\" \
+                with title \"TorShield\" subtitle \"App crashed\"' \
+               2>/dev/null\n\
            fi\n\
            sleep 5\n\
          done\n",
-        anchor = PF_ANCHOR
+        anchor = PF_ANCHOR,
+        uid    = uid,
     );
 
     let plist = format!(
