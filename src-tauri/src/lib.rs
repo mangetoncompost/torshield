@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use config::{Config, OpsecState, Shared};
 use firewall::{pf_disable, pf_enable, ensure_watchdog};
 use firefox::{ensure_canvasblocker, firefox_apply};
-use helper::{clear_logs, ensure_helper, ensure_opsec_dir, icon_path, lock_path, opsec_dir, sf_symbol_png};
+use helper::{clear_logs, ensure_helper, ensure_opsec_dir, icon_path, lock_path, notify, opsec_dir, sf_symbol_png};
 use mac_spoof::{mac_spoof_enable, mac_spoof_restore};
 use menu::{rebuild_menu, toggle_cfg};
 use proxy::{dns_leak_disable, dns_leak_enable, env_inject_disable, env_inject_enable,
@@ -40,6 +40,11 @@ async fn do_enable(shared: &Shared) {
         waited += 1;
     }
 
+    if !tor_ready() {
+        notify("Connection Failed", "Tor did not start - check that Tor is installed");
+        return;
+    }
+
     proxy_enable();
     hostname_anonymize();
     if cfg.dns_leak    { dns_leak_enable(); }
@@ -56,11 +61,17 @@ async fn do_enable(shared: &Shared) {
         firefox_apply(true, &cfg);
     }
 
-    let tor_ip  = fetch_tor_ip().await;
+    let tor_ip = fetch_tor_ip().await;
+
+    let notif_body = match &tor_ip {
+        Some(ip) => format!("Exit node: {ip}"),
+        None     => "Connected via Tor".into(),
+    };
+    notify("Connected", &notif_body);
 
     let mut lock = shared.lock().unwrap();
-    lock.0.active  = true;
-    lock.0.tor_ip  = tor_ip;
+    lock.0.active = true;
+    lock.0.tor_ip = tor_ip;
 }
 
 async fn do_disable(shared: &Shared) {
@@ -77,6 +88,7 @@ async fn do_disable(shared: &Shared) {
     if cfg.mac_spoof { mac_spoof_restore(); }
 
     std::fs::remove_file(lock_path()).ok();
+    notify("Disconnected", "All protections off");
 
     let mut lock = shared.lock().unwrap();
     lock.0.active  = false;
@@ -160,6 +172,11 @@ pub fn run() {
                                 new_tor_identity();
                                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                                 let ip = fetch_tor_ip().await;
+                                if let Some(ref exit) = ip {
+                                    notify("New Identity", &format!("Exit node: {exit}"));
+                                } else {
+                                    notify("New Identity", "Circuit rotated");
+                                }
                                 shared2.lock().unwrap().0.tor_ip = ip;
                                 let (state, cfg) = shared2.lock().unwrap().clone();
                                 rebuild_menu(&app, &state, &cfg);
@@ -271,6 +288,11 @@ pub fn run() {
                                 new_tor_identity();
                                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                                 let ip = fetch_tor_ip().await;
+                                if let Some(ref exit) = ip {
+                                    notify("Identity Rotated", &format!("Exit node: {exit}"));
+                                } else {
+                                    notify("Identity Rotated", "New circuit active");
+                                }
                                 shared3.lock().unwrap().0.tor_ip = ip;
                                 let (state, cfg) = shared3.lock().unwrap().clone();
                                 rebuild_menu(&app3, &state, &cfg);

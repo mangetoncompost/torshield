@@ -1,6 +1,6 @@
 [package]
 name = "torshield"
-version = "0.8.0"
+version = "0.8.1"
 description = "TorShield — menubar OPSEC app"
 authors = ["Silo"]
 edition = "2021"

@@ -1,6 +1,19 @@
 use std::process::Command;
 use tauri::Manager;
 
+pub fn notify(title: &str, body: &str) {
+    let script = format!(
+        "display notification {body} with title {title} subtitle \"TorShield\"",
+        title = applescript_quote(title),
+        body  = applescript_quote(body),
+    );
+    Command::new("osascript").args(["-e", &script]).output().ok();
+}
+
+fn applescript_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 pub const TS_HELPER: &str = "/usr/local/bin/ts_helper";
 
 pub fn opsec_dir() -> String {

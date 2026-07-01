@@ -4308,7 +4308,7 @@ checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
 name = "torshield"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "getrandom 0.3.4",
  "hmac",
