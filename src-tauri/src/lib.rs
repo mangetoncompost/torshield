@@ -227,7 +227,8 @@ pub fn run() {
                         }
                         "prot_logs" => { let cfg = toggle_cfg(&shared, |c| c.clear_logs  = !c.clear_logs);  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
                         "prot_ua"   => { let cfg = toggle_cfg(&shared, |c| c.ua_spoof    = !c.ua_spoof);    let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
-                        "prot_lang" => { let cfg = toggle_cfg(&shared, |c| c.lang_spoof  = !c.lang_spoof);  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
+                        "prot_lang"      => { let cfg = toggle_cfg(&shared, |c| c.lang_spoof  = !c.lang_spoof);  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
+                        "prot_snowflake" => { let cfg = toggle_cfg(&shared, |c| c.snowflake   = !c.snowflake);   let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
                         "prot_env"  => {
                             let cfg = toggle_cfg(&shared, |c| c.env_inject = !c.env_inject);
                             let (state, _) = shared.lock().unwrap().clone();

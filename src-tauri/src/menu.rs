@@ -7,7 +7,7 @@ use tauri::{
 
 use crate::config::{Config, OpsecState, Shared};
 use crate::helper::{helper_ok, icon_path};
-use crate::tor::tor_ready;
+use crate::tor::{tor_ready, snowflake_bin};
 
 pub fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
     use tauri_plugin_autostart::ManagerExt;
@@ -42,26 +42,24 @@ pub fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
     let item_real   = mkd("real_ip", &real_label);
 
     // Dependencies
-    let tor_ok_     = tor_ready();
-    let helper_ok__ = helper_ok();
-    let dnsmasq_bin = ["/opt/homebrew/sbin/dnsmasq", "/usr/local/sbin/dnsmasq", "/usr/sbin/dnsmasq"]
+    let tor_ok_       = tor_ready();
+    let helper_ok__   = helper_ok();
+    let dnsmasq_bin   = ["/opt/homebrew/sbin/dnsmasq", "/usr/local/sbin/dnsmasq", "/usr/sbin/dnsmasq"]
         .iter().any(|p| std::path::Path::new(p).exists());
-    let clang_ok    = Command::new("clang").arg("--version").output()
+    let clang_ok      = Command::new("clang").arg("--version").output()
         .map(|o| o.status.success()).unwrap_or(false);
+    let snowflake_ok  = snowflake_bin().is_some();
 
     let dep_status = |ok: bool, ok_label: &str, fix: &str| -> String {
-        if ok {
-            format!("[OK]  {ok_label}")
-        } else {
-            format!("[!]   {fix}")
-        }
+        if ok { format!("[OK]  {ok_label}") } else { format!("[!]   {fix}") }
     };
 
     let sub_deps = SubmenuBuilder::new(app, "Dependencies")
-        .item(&mkd("dep_helper",  &dep_status(helper_ok__, "ts_helper", "brew install? (run TorShield)")))
-        .item(&mkd("dep_tor",     &dep_status(tor_ok_,     "Tor",       "brew install tor")))
-        .item(&mkd("dep_dnsmasq", &dep_status(dnsmasq_bin, "dnsmasq",   "brew install dnsmasq")))
-        .item(&mkd("dep_clang",   &dep_status(clang_ok,    "clang",     "xcode-select --install")))
+        .item(&mkd("dep_helper",    &dep_status(helper_ok__,  "ts_helper",        "run TorShield to install")))
+        .item(&mkd("dep_tor",       &dep_status(tor_ok_,      "Tor",              "brew install tor")))
+        .item(&mkd("dep_dnsmasq",   &dep_status(dnsmasq_bin,  "dnsmasq",          "brew install dnsmasq")))
+        .item(&mkd("dep_clang",     &dep_status(clang_ok,     "clang",            "xcode-select --install")))
+        .item(&mkd("dep_snowflake", &dep_status(snowflake_ok, "snowflake-client", "brew install snowflake")))
         .build().unwrap();
 
     // Primary action
@@ -110,8 +108,9 @@ pub fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
 
     // Advanced
     let sub_adv = SubmenuBuilder::new(app, "Advanced")
-        .item(&chk("prot_lang", "Force English Locale",       cfg.lang_spoof))
-        .item(&chk("prot_env",  "Proxy Env Vars (CLI tools)", cfg.env_inject))
+        .item(&chk("prot_lang",      "Force English Locale",       cfg.lang_spoof))
+        .item(&chk("prot_env",       "Proxy Env Vars (CLI tools)", cfg.env_inject))
+        .item(&chk("prot_snowflake", "Snowflake Bridges (hide Tor from ISP)", cfg.snowflake))
         .build().unwrap();
 
     let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);

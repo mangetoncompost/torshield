@@ -26,6 +26,8 @@ pub struct Config {
     pub lang_spoof:  bool,
     #[serde(default)]
     pub env_inject:  bool,
+    #[serde(default)]
+    pub snowflake:   bool,
 }
 
 impl Default for Config {
@@ -38,6 +40,7 @@ impl Default for Config {
             clear_logs: true, firefox: true, resist_fp: true,
             ua_spoof: true, lang_spoof: true,
             env_inject: false,
+            snowflake:  false,
         }
     }
 }

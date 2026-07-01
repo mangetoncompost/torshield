@@ -20,6 +20,16 @@ pub fn tor_pid() -> Option<u32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+pub fn snowflake_bin() -> Option<String> {
+    for candidate in [
+        "/opt/homebrew/bin/snowflake-client",
+        "/usr/local/bin/snowflake-client",
+    ] {
+        if std::path::Path::new(candidate).exists() { return Some(candidate.into()); }
+    }
+    None
+}
+
 fn tor_bin() -> Option<String> {
     // Resolve to an absolute path - never rely on PATH for a security-critical binary.
     for candidate in ["/opt/homebrew/bin/tor", "/usr/local/bin/tor", "/usr/bin/tor"] {
@@ -42,11 +52,27 @@ pub fn start_tor(cfg: &Config) -> bool {
     let excluded = cfg.excluded_nodes();
     let exclude_line = if excluded.is_empty() { String::new() }
         else { format!("ExcludeExitNodes {}\nStrictNodes 1\n", excluded) };
+
+    let snowflake_line = if cfg.snowflake {
+        snowflake_bin()
+            .map(|bin| format!(
+                "UseBridges 1\n\
+                 ClientTransportPlugin snowflake exec {bin} \
+                 -front ajax.aspnetcdn.com \
+                 -url https://snowflake-broker.torproject.net.global.prod.fastly.net/ \
+                 -ice stun:stun.l.google.com:19302\n\
+                 Bridge snowflake 192.0.2.3:1 2B280B23E1107BB62ABFC40DDCC8824814F7B9CB\n"
+            ))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
     std::fs::write(&conf, format!(
         "SocksPort 9050\nControlPort 9051\nCookieAuthentication 1\n\
          CookieAuthFile {cookie}/control_auth_cookie\n\
          DataDirectory {data}\nLog notice file {log}\n\
-         DNSPort 9053\nMaxCircuitDirtiness 600\n{exclude_line}"
+         DNSPort 9053\nMaxCircuitDirtiness 600\n{exclude_line}{snowflake_line}"
     )).ok();
     // Restrict torrc to owner-only: prevents local modification of exit node
     // exclusions, CookieAuthFile path, or injection of HiddenServiceDir.
