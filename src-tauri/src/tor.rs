@@ -157,6 +157,18 @@ pub async fn fetch_tor_ip() -> Option<String> {
     client.get("https://api.ipify.org").send().await.ok()?.text().await.ok()
 }
 
+// Fetch the real public IP directly (no proxy) - only called when TorShield is OFF,
+// so the IP is not meant to be hidden. Uses no_proxy() to bypass any stale system
+// proxy config left from a previous session.
+pub async fn fetch_real_ip() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(8)).build().ok()?;
+    let ip = client.get("https://api.ipify.org").send().await.ok()?.text().await.ok()?;
+    let ip = ip.trim().to_string();
+    if ip.is_empty() { None } else { Some(ip) }
+}
+
 // Read the real IP from the default interface without any outbound network request.
 // Avoids exposing the real IP to api.ipify.org at startup before Tor is active.
 pub fn local_real_ip() -> Option<String> {

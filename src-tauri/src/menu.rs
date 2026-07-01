@@ -29,12 +29,12 @@ pub fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
     let (status_label, real_label) = if active {
         (
             format!("Connected  |  Exit: {}", tor_ip),
-            format!("Local IP: {}  (concealed)", real_ip),
+            format!("Real IP: {}  (concealed)", real_ip),
         )
     } else {
         (
             "Disconnected".into(),
-            format!("Local IP: {}", real_ip),
+            format!("Real IP: {}", real_ip),
         )
     };
 

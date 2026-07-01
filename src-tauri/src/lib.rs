@@ -21,7 +21,7 @@ use menu::{rebuild_menu, toggle_cfg};
 use proxy::{dns_leak_disable, dns_leak_enable, env_inject_disable, env_inject_enable,
             hostname_anonymize, hostname_restore,
             ipv6_disable, ipv6_restore, proxy_disable, proxy_enable};
-use tor::{fetch_tor_ip, local_real_ip, new_tor_identity, start_tor, stop_tor, tor_ready};
+use tor::{fetch_real_ip, fetch_tor_ip, local_real_ip, new_tor_identity, start_tor, stop_tor, tor_ready};
 
 async fn do_enable(shared: &Shared) {
     let cfg = shared.lock().unwrap().1.clone();
@@ -90,10 +90,12 @@ async fn do_disable(shared: &Shared) {
     std::fs::remove_file(lock_path()).ok();
     notify("Disconnected", "All protections off");
 
+    let real_ip = fetch_real_ip().await.or_else(local_real_ip);
+
     let mut lock = shared.lock().unwrap();
     lock.0.active  = false;
     lock.0.tor_ip  = None;
-    lock.0.real_ip = local_real_ip();
+    lock.0.real_ip = real_ip;
 }
 
 fn emergency_teardown(cfg: &Config) {
@@ -254,7 +256,8 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Show local IP at startup without any outbound request (no real IP leak).
+            // Show local IP immediately (no network), then fetch public IP in background
+            // and update the menu when it arrives.
             {
                 let ip = local_real_ip();
                 let mut lock = shared.lock().unwrap();
@@ -262,6 +265,21 @@ pub fn run() {
                 let (state, cfg) = lock.clone();
                 drop(lock);
                 rebuild_menu(&app_handle, &state, &cfg);
+            }
+            {
+                let shared_ip = shared.clone();
+                let app_ip    = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(ip) = fetch_real_ip().await {
+                        let mut lock = shared_ip.lock().unwrap();
+                        if !lock.0.active {
+                            lock.0.real_ip = Some(ip);
+                            let (state, cfg) = lock.clone();
+                            drop(lock);
+                            rebuild_menu(&app_ip, &state, &cfg);
+                        }
+                    }
+                });
             }
 
             let shared3 = shared.clone();
