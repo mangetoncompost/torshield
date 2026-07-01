@@ -197,6 +197,7 @@ pub fn run() {
                         "node_fr" => { let cfg = toggle_cfg(&shared, |c| c.exclude_fr = !c.exclude_fr); let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
 
                         "rot_off" => { let cfg = toggle_cfg(&shared, |c| c.rotate_mins = 0);  rot_tx.send(0).ok();  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
+                        "rot_2"   => { let cfg = toggle_cfg(&shared, |c| c.rotate_mins = 2);  rot_tx.send(2).ok();  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
                         "rot_5"   => { let cfg = toggle_cfg(&shared, |c| c.rotate_mins = 5);  rot_tx.send(5).ok();  let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
                         "rot_15"  => { let cfg = toggle_cfg(&shared, |c| c.rotate_mins = 15); rot_tx.send(15).ok(); let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }
                         "rot_30"  => { let cfg = toggle_cfg(&shared, |c| c.rotate_mins = 30); rot_tx.send(30).ok(); let s = shared.lock().unwrap().0.clone(); rebuild_menu(&app, &s, &cfg); }

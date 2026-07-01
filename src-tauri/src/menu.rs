@@ -83,6 +83,7 @@ pub fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
     // Identity rotation
     let rot_label = match cfg.rotate_mins {
         0  => "Identity Rotation: Off",
+        2  => "Identity Rotation: 2 min",
         5  => "Identity Rotation: 5 min",
         15 => "Identity Rotation: 15 min",
         30 => "Identity Rotation: 30 min",
@@ -90,6 +91,7 @@ pub fn rebuild_menu(app: &AppHandle, state: &OpsecState, cfg: &Config) {
     };
     let sub_rotate = SubmenuBuilder::new(app, rot_label)
         .item(&chk("rot_off", "Disabled",       cfg.rotate_mins == 0))
+        .item(&chk("rot_2",   "Every 2 min",    cfg.rotate_mins == 2))
         .item(&chk("rot_5",   "Every 5 min",    cfg.rotate_mins == 5))
         .item(&chk("rot_15",  "Every 15 min",   cfg.rotate_mins == 15))
         .item(&chk("rot_30",  "Every 30 min",   cfg.rotate_mins == 30))
